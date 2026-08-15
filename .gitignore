@@ -1,0 +1,16 @@
+# dependencies
+node_modules/
+
+# secrets / local runtime
+.token
+*.env
+.env
+!.env.example
+
+# internal dev notes (kept local, not published)
+_STATE.md
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini

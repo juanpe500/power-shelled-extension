@@ -1,0 +1,217 @@
+/* ============================================================================
+   PALETTE — edit every UI color in the :root block below. Terminal fg/bg are
+   read from --term-* by sidepanel.js; the tab-group color is GROUP_COLOR in
+   background.js. NOTE: CSS comments do NOT nest — never wrap a block that
+   already contains slash-star comments, it breaks the whole stylesheet.
+
+   Original dark defaults (for reference):
+     --bg #1a1b1e  --bg-panel #26282c  --bg-elevated #202226  --bg-control #303236
+     --bg-hover #3a3d42  --border #34363b  --border-input #3a3d42
+     --accent #3b6ea5  --accent-hover #4a7fb8  --sel #33455c  --link #7fb0e6
+     --text #dddddd  --text-bright #ffffff  --text-dim #9aa0a6  --text-muted #7a7f86
+     --term-bg #1a1b1e  --term-fg #e6e6e6
+     --ok #22cc88  --bad #bb2233  --kill #aa5555  --kill-hover #ee6666
+   ========================================================================== */
+:root {
+    --bg: #000000;
+    --bg-panel: #000000;
+    --bg-elevated: #000000;
+    --bg-control: #000000;
+    --bg-hover: #343434;
+    --border: #0e4c00;
+    --border-input: #3a3d42;
+    --accent: #002806;
+    --accent-hover: #056801;
+    --sel: #335c39;
+    --link: #7fb0e6;
+    --text: #ffffff;
+    --text-bright: #ffffff;
+    --text-dim: #9aa0a6;
+    --text-muted: #c4c4c4;
+    --term-bg: #000000;
+    --term-fg: #e6e6e6;
+    --ok: #22cc88;
+    --bad: #bb2233;
+    --kill: #aa5555;
+    --kill-hover: #ee6666;
+    --scroll-thumb: rgba(255, 255, 255, .16);
+    --scroll-thumb-hover: rgba(255, 255, 255, .34);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  font: 13px/1.4 "Segoe UI", system-ui, sans-serif;
+  color: var(--text); background: var(--bg);
+}
+#app { display: flex; flex-direction: column; height: 100vh; }
+
+#bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+#bar #title {
+  font-weight: 600; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; max-width: 55%;
+}
+.grow { flex: 1 1 auto; }
+.icon {
+  background: transparent; border: none; color: var(--text);
+  font-size: 16px; cursor: pointer; padding: 2px 6px; border-radius: 5px;
+}
+.icon:hover { background: var(--border); color: var(--text-bright); }
+
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: 0 0 auto; }
+.dot.on { background: var(--ok); }
+
+.panel {
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  padding: 10px; flex: 0 0 auto; max-height: 55vh; overflow: auto;
+}
+.panel.hidden { display: none; }
+/* the New terminal form fills all remaining height (hides the terminal below it) */
+#newForm:not(.hidden) { flex: 1 1 auto; min-height: 0; max-height: none; }
+#newForm:not(.hidden) ~ #termWrap { display: none; }
+.panel-h { font-weight: 600; margin-bottom: 8px; color: var(--text-dim); text-transform: uppercase; font-size: 11px; letter-spacing: .5px; }
+.panel label { display: block; margin: 6px 0; }
+.panel input, .panel select {
+  width: 100%; margin-top: 3px; padding: 6px 8px;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border-input); border-radius: 5px;
+  font: inherit;
+}
+.row { display: flex; gap: 8px; margin-top: 10px; }
+.panel button {
+  padding: 6px 12px; border-radius: 5px; border: 1px solid var(--border-input);
+  background: var(--bg-control); color: var(--text); cursor: pointer; font: inherit;
+}
+.panel button:hover { background: var(--bg-hover); }
+.panel button.primary { background: var(--accent); border-color: var(--accent); color: var(--text-bright); }
+.panel button.primary:hover { background: var(--accent-hover); }
+.hint { color: var(--text-muted); font-size: 11px; margin-top: 8px; }
+
+.sess-list { list-style: none; margin: 0; padding: 0; }
+.sess-list li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px; border-radius: 6px; cursor: pointer;
+}
+.sess-list li:hover { background: var(--bg-control); }
+.sess-list li.active { background: var(--sel); }
+.sess-list li.dead { opacity: .55; }
+
+/* session list inside the empty state */
+#emptyList { text-align: left; margin: 4px 0 14px; max-height: 40vh; overflow-y: auto; }
+#emptyList:empty { display: none; }
+
+/* folder picker in the New terminal form */
+.browser { border: 1px solid var(--border); border-radius: 6px; padding: 6px; margin-bottom: 8px; background: var(--bg-elevated); }
+.crumbs { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; margin-bottom: 4px; font-size: 12px; }
+.crumbs button {
+  background: transparent; border: none; color: var(--link); cursor: pointer;
+  font: inherit; padding: 1px 3px; border-radius: 4px; max-width: 130px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.crumbs button:hover { background: var(--bg-control); }
+.crumbs .sep { color: var(--text-muted); }
+.dirlist { max-height: 30vh; overflow-y: auto; }
+.dirlist li { padding: 5px 6px; }
+.dirlist li .d-ic { flex: 0 0 auto; }
+.dirlist li .d-name { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dirlist li .d-into { color: var(--text-muted); font-size: 12px; }
+.cwd-pick { margin-top: 6px; font-size: 11px; color: var(--text-dim); word-break: break-all; }
+.cwd-pick #f-cwd-label { color: var(--text); }
+
+/* emoji picker for the icon field */
+#f-icon { cursor: pointer; text-align: center; }
+.emoji-pop {
+  display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px;
+  margin: -4px 0 8px; padding: 6px; background: var(--bg-elevated);
+  border: 1px solid var(--border); border-radius: 6px; max-height: 150px; overflow-y: auto;
+}
+.emoji-pop.hidden { display: none; }
+.emoji-pop .emoji {
+  background: transparent; border: none; cursor: pointer; font-size: 18px;
+  padding: 3px; border-radius: 5px; line-height: 1;
+}
+.emoji-pop .emoji:hover { background: var(--sel); }
+
+.chk { display: flex; align-items: center; gap: 6px; flex-direction: row; font-size: 12px; color: var(--text); cursor: pointer; }
+.chk input { width: auto; margin: 0; }
+.chk code { background: var(--bg-panel); padding: 0 4px; border-radius: 3px; color: var(--text); }
+.s-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: 0 0 auto; }
+.s-dot.dead { background: var(--bad); }
+.s-name { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.s-meta { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+.s-kill { background: transparent; border: none; color: var(--kill); cursor: pointer; font-size: 14px; padding: 0 4px; }
+.s-kill:hover { color: var(--kill-hover); }
+.panel-empty { color: var(--text-muted); font-size: 12px; padding: 4px; }
+.panel-empty.hidden { display: none; }
+
+/* workspace editor rows in settings */
+.ws-list li { gap: 6px; cursor: default; }
+.ws-list li:hover { background: var(--bg-control); }
+.ws-list .s-name { flex: 0 0 auto; color: var(--link); }
+.ws-list .ws-path { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+
+#sicon { flex: 0 0 auto; font-size: 15px; }
+#sicon:empty { display: none; }
+
+#termWrap { flex: 1 1 auto; min-height: 0; position: relative; }
+.xterm { height: 100%; }
+
+/* multi-pane grid — grid-template + pane/gutter placement are set inline by layoutPanes() */
+#panes { position: absolute; inset: 0; padding: 3px; display: grid; background: var(--term-bg); }
+.pane {
+  position: relative; display: flex; flex-direction: column;
+  min-width: 0; min-height: 0; overflow: hidden;
+  background: var(--term-bg); border: 1px solid var(--border); border-radius: 5px;
+}
+#panes.solo .pane { border: none; border-radius: 0; }
+.pane.focused { border-color: var(--accent); }
+#panes.solo .pane.focused { border: none; }
+/* draggable dividers between panes */
+.pane-gutter { z-index: 3; background: transparent; border-radius: 3px; transition: background .12s; }
+.pane-gutter.x { cursor: col-resize; }
+.pane-gutter.y { cursor: row-resize; }
+.pane-gutter:hover, .pane-gutter.dragging { background: var(--accent); }
+.pane-head {
+  display: flex; align-items: center; gap: 5px; flex: 0 0 auto;
+  padding: 2px 6px; font-size: 11px; background: var(--bg-panel); color: var(--text-dim);
+}
+#panes.solo .pane-head { display: none; }
+.pane-head .p-ic { flex: 0 0 auto; }
+.pane-head .p-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-head .p-close { background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 12px; padding: 0 3px; line-height: 1; }
+.pane-head .p-close:hover { color: var(--kill-hover); }
+.pane-host { flex: 1 1 auto; position: relative; min-height: 0; }
+.pane-host .xterm { position: absolute; inset: 0; padding: 2px; }
+
+/* thin, subtle scrollbars everywhere; the transparent track means nothing shows
+   when the content fits (only the thumb appears, and only while scrollable). */
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb); border-radius: 8px;
+  border: 3px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+/* xterm draws its own viewport — keep its scrollbar area transparent too */
+.xterm-viewport { background: transparent !important; }
+
+.empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: var(--bg); text-align: center; color: var(--text-dim); }
+.empty.hidden { display: none; }
+.empty-inner { max-width: 240px; }
+.empty-icon { font-size: 34px; opacity: .5; margin-bottom: 10px; }
+#empty-msg { margin-bottom: 14px; line-height: 1.5; }
+.empty .row button { padding: 6px 12px; border-radius: 5px; border: 1px solid var(--border-input);
+  background: var(--bg-control); color: var(--text); cursor: pointer; font: inherit; }
+.empty .row button.primary { background: var(--accent); border-color: var(--accent); color: var(--text-bright); }
+
+.status {
+  flex: 0 0 auto; padding: 3px 10px; font-size: 11px; color: var(--text-muted);
+  background: var(--bg-panel); border-top: 1px solid var(--border); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="vendor/xterm.css" />
+  <link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="bar">
+      <button id="menuBtn" class="icon" title="Sessions">☰</button>
+      <button id="orientBtn" class="icon hidden" title="Split direction">⬌</button>
+      <span id="sicon"></span>
+      <span id="title">Power Shell(ed)</span>
+      <span id="dot" class="dot" title="disconnected"></span>
+      <div class="grow"></div>
+      <button id="newBtn" class="icon" title="New terminal">＋</button>
+      <button id="tabBtn" class="icon" title="Open in new tab">⧉</button>
+      <button id="cfgBtn" class="icon" title="Server settings">⚙</button>
+    </header>
+
+    <!-- session drawer -->
+    <div id="drawer" class="panel hidden">
+      <div class="panel-h">Terminals</div>
+      <ul id="sessList" class="sess-list"></ul>
+      <div class="panel-empty" id="sessEmpty">No terminals yet.</div>
+    </div>
+
+    <!-- new terminal form -->
+    <div id="newForm" class="panel hidden">
+      <div class="panel-h">New terminal</div>
+      <div class="row">
+        <label style="flex:0 0 64px">Icon <input id="f-icon" maxlength="4" placeholder="🖥️" readonly /></label>
+        <label style="flex:1 1 auto">Name <input id="f-name" placeholder="e.g. claude viclix" /></label>
+      </div>
+      <div id="emojiPop" class="emoji-pop hidden"></div>
+      <label>Shell <select id="f-shell"></select></label>
+      <label>Workspace
+        <select id="f-ws"><option value="">— none (home dir) —</option></select>
+      </label>
+      <div id="f-browser" class="browser hidden">
+        <div id="f-crumbs" class="crumbs"></div>
+        <ul id="f-dirs" class="sess-list dirlist"></ul>
+        <div id="f-dirs-empty" class="hint">No subfolders here.</div>
+        <div class="cwd-pick">📁 <span id="f-cwd-label"></span></div>
+      </div>
+      <label>Run on start <input id="f-cmd" placeholder="e.g. cc viclix" /></label>
+      <label class="chk"><input type="checkbox" id="f-cont" /> Continue previous session (<code>--continue</code>)</label>
+      <div class="row">
+        <button id="f-create" class="primary">Create &amp; open</button>
+        <button id="f-cancel">Cancel</button>
+      </div>
+    </div>
+
+    <!-- settings -->
+    <div id="cfgForm" class="panel hidden">
+      <div class="panel-h">Server settings</div>
+      <label>Host <input id="c-host" value="127.0.0.1" /></label>
+      <label>Port <input id="c-port" value="3777" /></label>
+      <label>Token <input id="c-token" placeholder="paste from server console" /></label>
+      <div class="row">
+        <button id="c-save" class="primary">Save &amp; connect</button>
+        <button id="c-cancel">Cancel</button>
+      </div>
+      <div class="hint">The server prints its port &amp; token when it starts.</div>
+
+      <div class="panel-h" style="margin-top:16px">Workspaces</div>
+      <div class="hint" style="margin-top:0">Named roots the New-terminal folder picker starts from. Saved in the browser.</div>
+      <ul id="wsList" class="sess-list ws-list"></ul>
+      <div class="panel-empty" id="wsEmpty">No workspaces yet — add one below.</div>
+      <div class="row">
+        <input id="ws-name" placeholder="name (e.g. c-fastapi)" style="flex:0 0 40%" />
+        <input id="ws-path" placeholder="C:\path\to\folder" />
+      </div>
+      <div class="row"><button id="ws-add">＋ Add workspace</button></div>
+    </div>
+
+    <div id="termWrap">
+      <div id="panes" class="solo"></div>
+      <div id="empty" class="empty hidden">
+        <div class="empty-inner">
+          <div class="empty-icon">🖥️</div>
+          <div id="empty-msg">No terminal attached to this tab.</div>
+          <ul id="emptyList" class="sess-list"></ul>
+          <div class="panel-empty" id="emptyListEmpty">No terminals running yet.</div>
+          <div class="row" style="justify-content:center">
+            <button id="empty-new" class="primary">＋ New here</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

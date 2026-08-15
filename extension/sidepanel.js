@@ -1,0 +1,677 @@
+'use strict';
+
+// ---- config -------------------------------------------------------------
+// Terminals are always per-tab: a session is bound to the tab it was opened in,
+// does not follow you to other tabs, and auto-reattaches when you return.
+const DEFAULTS = { host: '127.0.0.1', port: '3777', token: '' };
+let cfg = { ...DEFAULTS };
+let paneStore = {};     // { tabId: {ids:[sessionId,...], orient:'cols'|'rows'} } (persisted as ct_panes)
+let panes = [];         // live panes for the current tab: [{id, term, fit, ws, el, host, ic, nm, meta}]
+let focusedId = null;   // which pane has focus (drives the top-bar title + conn dot)
+let zoomStore = {};     // { sessionId: fontSizePx } — per-session zoom (persisted as ct_zoom)
+const MAX_PANES = 6;
+const DEFAULT_FONT = 13, MIN_FONT = 6, MAX_FONT = 40;
+let currentTabId = null, currentWinId = null;
+let lastList = [];
+
+const $ = (id) => document.getElementById(id);
+const httpBase = () => `http://${cfg.host}:${cfg.port}`;
+const wsBase = () => `ws://${cfg.host}:${cfg.port}`;
+
+function setStatus(msg) { $('status').textContent = msg; }
+function setConnected(on) { $('dot').classList.toggle('on', !!on); $('dot').title = on ? 'connected' : 'disconnected'; }
+
+async function api(path, opts = {}) {
+  const r = await fetch(httpBase() + path, {
+    ...opts,
+    headers: { 'content-type': 'application/json', 'x-ct-token': cfg.token, ...(opts.headers || {}) },
+  });
+  if (!r.ok) throw new Error(`${r.status} ${await r.text().catch(() => '')}`);
+  return r.status === 204 ? null : r.json();
+}
+
+// ---- storage ------------------------------------------------------------
+function loadState() {
+  return new Promise((res) => {
+    chrome.storage.local.get(['ct_cfg', 'ct_panes', 'ct_bindings', 'ct_zoom', 'ct_workspaces'], (o) => {
+      if (o.ct_cfg) cfg = { ...DEFAULTS, ...o.ct_cfg };
+      zoomStore = o.ct_zoom || {};
+      workspaces = o.ct_workspaces || [];
+      if (o.ct_panes) paneStore = o.ct_panes;
+      else if (o.ct_bindings) {                 // migrate old one-session-per-tab format
+        paneStore = {};
+        for (const [t, sid] of Object.entries(o.ct_bindings)) paneStore[t] = { ids: [sid], orient: 'cols' };
+        chrome.storage.local.set({ ct_panes: paneStore });
+      } else paneStore = {};
+      res();
+    });
+  });
+}
+function saveCfg() { chrome.storage.local.set({ ct_cfg: cfg }); }
+function savePanes() { chrome.storage.local.set({ ct_panes: paneStore }); }
+function saveZoom() { chrome.storage.local.set({ ct_zoom: zoomStore }); }
+
+// current tab's pane record + accessors
+function tabRec() { return currentTabId != null ? paneStore[currentTabId] : null; }
+function tabIds() { const r = tabRec(); return r && r.ids ? r.ids : []; }
+function tabOrient() { const r = tabRec(); return (r && r.orient) || 'cols'; }
+function setTabRec(ids, orient) {
+  if (currentTabId == null) return;
+  if (ids.length) paneStore[currentTabId] = { ids, orient: orient || tabOrient() };
+  else delete paneStore[currentTabId];
+  savePanes();
+}
+
+// ---- tab awareness ------------------------------------------------------
+async function initTab() {
+  try {
+    const w = await chrome.windows.getCurrent();
+    currentWinId = w.id;
+    const tabs = await chrome.tabs.query({ active: true, windowId: w.id });
+    currentTabId = tabs[0] ? tabs[0].id : null;
+  } catch (_) {}
+}
+chrome.tabs.onActivated.addListener((info) => {
+  if (info.windowId !== currentWinId) return;
+  currentTabId = info.tabId;
+  applyView();
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (paneStore[tabId]) { delete paneStore[tabId]; savePanes(); }
+});
+// Keep our in-memory paneStore synced with what other panel documents write, so a
+// stale copy never clobbers another tab's panes (and the background's tab-grouping
+// stays correct).
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.ct_panes) { paneStore = changes.ct_panes.newValue || {}; applyView(); renderList(lastList); }
+  if (changes.ct_workspaces) { workspaces = changes.ct_workspaces.newValue || []; populateWsDropdown(); renderWsEditor(); }
+});
+
+// ---- panes (multi-terminal grid) ----------------------------------------
+function termColors() {
+  const cs = getComputedStyle(document.documentElement);
+  return {
+    background: cs.getPropertyValue('--term-bg').trim() || '#1a1b1e',
+    foreground: cs.getPropertyValue('--term-fg').trim() || '#e6e6e6',
+  };
+}
+function makePane(id) {
+  const wrap = document.createElement('div'); wrap.className = 'pane'; wrap.dataset.id = id;
+  const head = document.createElement('div'); head.className = 'pane-head';
+  const ic = document.createElement('span'); ic.className = 'p-ic';
+  const nm = document.createElement('span'); nm.className = 'p-name'; nm.textContent = '…';
+  const close = document.createElement('button'); close.className = 'p-close'; close.textContent = '✕';
+  close.title = 'Close pane (session keeps running)';
+  head.append(ic, nm, close);
+  const host = document.createElement('div'); host.className = 'pane-host';
+  wrap.append(head, host);
+  $('panes').appendChild(wrap);
+
+  const term = new Terminal({
+    cursorBlink: true, fontFamily: 'Cascadia Mono, Consolas, monospace',
+    fontSize: zoomStore[id] || DEFAULT_FONT, theme: termColors(), scrollback: 5000,
+  });
+  const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
+  const pane = { id, term, fit, ws: null, el: wrap, host, ic, nm, meta: null };
+  panes.push(pane);
+
+  term.onData((d) => { if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'in', d })); });
+  // per-pane zoom: Ctrl +/- / Ctrl+0 (reset) — intercepted so it doesn't reach the shell or zoom the page
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type === 'keydown' && e.ctrlKey && !e.altKey && !e.metaKey) {
+      if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomPane(pane, +1); return false; }
+      if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomPane(pane, -1); return false; }
+      if (e.key === '0') { e.preventDefault(); setZoom(pane, DEFAULT_FONT); return false; }
+    }
+    return true;
+  });
+  host.addEventListener('wheel', (e) => { if (!e.ctrlKey) return; e.preventDefault(); zoomPane(pane, e.deltaY < 0 ? +1 : -1); }, { passive: false });
+  wrap.addEventListener('mousedown', () => setFocused(id));
+  close.addEventListener('click', (e) => { e.stopPropagation(); removePane(id); });
+  connectPane(pane);
+  return pane;
+}
+function currentFont(pane) { return zoomStore[pane.id] || DEFAULT_FONT; }
+function setZoom(pane, size) {
+  size = Math.max(MIN_FONT, Math.min(MAX_FONT, Math.round(size)));
+  zoomStore[pane.id] = size; saveZoom();
+  try { if (pane.term.options) pane.term.options.fontSize = size; else pane.term.setOption('fontSize', size); } catch (_) {}
+  fitPane(pane);
+  setStatus(`zoom: ${size}px`);
+}
+function zoomPane(pane, delta) { setZoom(pane, currentFont(pane) + delta); }
+function connectPane(pane) {
+  const url = `${wsBase()}/attach?id=${encodeURIComponent(pane.id)}&token=${encodeURIComponent(cfg.token)}`;
+  const sock = new WebSocket(url); pane.ws = sock;
+  sock.onopen = () => { fitPane(pane); updateConnDot(); };
+  sock.onclose = () => updateConnDot();
+  sock.onerror = () => updateConnDot();
+  sock.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
+    if (m.t === 'hello') { pane.meta = m.session; pane.nm.textContent = m.session.name; pane.ic.textContent = m.session.icon || ''; updateHeader(); }
+    else if (m.t === 'out') pane.term.write(m.d);
+    else if (m.t === 'exit') pane.term.write(`\r\n\x1b[90m[process exited: ${m.code}]\x1b[0m\r\n`);
+    else if (m.t === 'killed') pane.term.write(`\r\n\x1b[90m[terminal killed]\x1b[0m\r\n`);
+  };
+}
+function destroyPane(pane) {
+  try { pane.ws && pane.ws.close(); } catch (_) {}
+  try { pane.term.dispose(); } catch (_) {}
+  try { pane.el.remove(); } catch (_) {}
+  panes = panes.filter((p) => p !== pane);
+}
+function fitPane(pane) {
+  requestAnimationFrame(() => {
+    try { pane.fit.fit(); } catch (_) {}
+    if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'resize', c: pane.term.cols, r: pane.term.rows }));
+    try { pane.term.refresh(0, pane.term.rows - 1); } catch (_) {}
+  });
+}
+function refitAll() { for (const p of panes) fitPane(p); }
+
+function setFocused(id) {
+  focusedId = id;
+  for (const p of panes) p.el.classList.toggle('focused', p.id === id);
+  const p = panes.find((x) => x.id === id); if (p) p.term.focus();
+  updateConnDot(); updateHeader();
+}
+function updateConnDot() {
+  const f = panes.find((p) => p.id === focusedId) || panes[0];
+  setConnected(!!(f && f.ws && f.ws.readyState === 1));
+}
+function updateHeader() {
+  const n = panes.length;
+  const f = panes.find((p) => p.id === focusedId) || panes[0];
+  $('sicon').textContent = f && f.meta ? (f.meta.icon || '') : '';
+  const nm = f && f.meta ? f.meta.name : (n ? '…' : 'Power Shell(ed)');
+  $('title').textContent = n > 1 ? `${nm} · ${n} panes` : nm;
+}
+
+// Layouts per pane count. 1 = full · 2 = cols/rows · 3 = cols/rows/master-left/
+// master-top · 4-6 = forced grid. The toolbar button cycles the options.
+const LAYOUTS = {
+  1: ['single'],
+  2: ['cols', 'rows'],
+  3: ['cols', 'rows', 'left', 'top'],
+  4: ['grid2'],
+  5: ['grid3'],
+  6: ['grid3'],
+};
+const LAYOUT_ICON = { single: '▭', cols: '⬌', rows: '⬍', left: '◧', top: '⬓', grid2: '▦', grid3: '▦' };
+const LAYOUT_NAME = {
+  single: 'full', cols: 'side by side', rows: 'top / bottom',
+  left: 'left master + stacked right', top: 'top master + split bottom', grid2: 'grid', grid3: 'grid',
+};
+function layoutsFor(n) { return LAYOUTS[Math.min(Math.max(n, 1), 6)] || ['single']; }
+function currentLayout() {
+  const opts = layoutsFor(panes.length);
+  const k = tabOrient();
+  return opts.includes(k) ? k : opts[0];
+}
+
+// A layout spec: grid of ncol×nrow real tracks, where cells place panes and
+// gutters mark draggable boundaries. from/to are real cross-track indices (1-based).
+function layoutSpec(key, n) {
+  const cols = (m) => ({ ncol: m, nrow: 1,
+    cells: Array.from({ length: m }, (_, i) => ({ c: i + 1, r: 1 })),
+    gutters: Array.from({ length: m - 1 }, (_, i) => ({ axis: 'x', at: i + 1, from: 1, to: 1 })) });
+  const rows = (m) => ({ ncol: 1, nrow: m,
+    cells: Array.from({ length: m }, (_, i) => ({ c: 1, r: i + 1 })),
+    gutters: Array.from({ length: m - 1 }, (_, i) => ({ axis: 'y', at: i + 1, from: 1, to: 1 })) });
+  switch (key) {
+    case 'single': return { ncol: 1, nrow: 1, cells: [{ c: 1, r: 1 }], gutters: [] };
+    case 'cols': return cols(n);
+    case 'rows': return rows(n);
+    case 'left': return { ncol: 2, nrow: 2,
+      cells: [{ c: 1, r: 1, rs: 2 }, { c: 2, r: 1 }, { c: 2, r: 2 }],
+      gutters: [{ axis: 'x', at: 1, from: 1, to: 2 }, { axis: 'y', at: 1, from: 2, to: 2 }] };
+    case 'top': return { ncol: 2, nrow: 2,
+      cells: [{ c: 1, r: 1, cs: 2 }, { c: 1, r: 2 }, { c: 2, r: 2 }],
+      gutters: [{ axis: 'y', at: 1, from: 1, to: 2 }, { axis: 'x', at: 1, from: 2, to: 2 }] };
+    case 'grid2': return { ncol: 2, nrow: 2,
+      cells: [{ c: 1, r: 1 }, { c: 2, r: 1 }, { c: 1, r: 2 }, { c: 2, r: 2 }],
+      gutters: [{ axis: 'x', at: 1, from: 1, to: 2 }, { axis: 'y', at: 1, from: 1, to: 2 }] };
+    case 'grid3': return { ncol: 3, nrow: 2,
+      cells: Array.from({ length: n }, (_, i) => ({ c: (i % 3) + 1, r: Math.floor(i / 3) + 1 })),
+      gutters: [{ axis: 'x', at: 1, from: 1, to: 2 }, { axis: 'x', at: 2, from: 1, to: 2 }, { axis: 'y', at: 1, from: 1, to: 3 }] };
+  }
+  return { ncol: 1, nrow: 1, cells: [{ c: 1, r: 1 }], gutters: [] };
+}
+
+const GUT = 6; // px gutter track width
+function trackList(fr) { return fr.map((f, i) => (i ? GUT + 'px ' : '') + f + 'fr').join(' '); }
+// per-tab, per-(layout+count) fr sizes; defaults to equal tracks
+function sizeState(key, spec) {
+  const rec = tabRec();
+  const def = { cols: Array(spec.ncol).fill(1), rows: Array(spec.nrow).fill(1) };
+  if (!rec) return def;
+  rec.sizes = rec.sizes || {};
+  const sk = key + ':' + panes.length;
+  let s = rec.sizes[sk];
+  if (!s || s.cols.length !== spec.ncol || s.rows.length !== spec.nrow) { s = def; rec.sizes[sk] = s; }
+  return s;
+}
+
+function layoutPanes() {
+  const el = $('panes');
+  const key = currentLayout();
+  const spec = layoutSpec(key, panes.length);
+  const sizes = sizeState(key, spec);
+  el.classList.toggle('solo', panes.length <= 1);
+  el.style.gridTemplateColumns = trackList(sizes.cols);
+  el.style.gridTemplateRows = trackList(sizes.rows);
+  el.querySelectorAll('.pane-gutter').forEach((g) => g.remove());
+  panes.forEach((p, idx) => {
+    const cell = spec.cells[idx] || { c: 1, r: 1 };
+    p.el.style.gridColumn = `${2 * cell.c - 1} / span ${2 * (cell.cs || 1) - 1}`;
+    p.el.style.gridRow = `${2 * cell.r - 1} / span ${2 * (cell.rs || 1) - 1}`;
+  });
+  for (const g of spec.gutters) addGutter(el, g, sizes);
+  const opts = layoutsFor(panes.length);
+  const btn = $('orientBtn');
+  btn.classList.toggle('hidden', opts.length <= 1);
+  btn.textContent = LAYOUT_ICON[key] || '▦';
+  btn.title = 'Layout: ' + (LAYOUT_NAME[key] || key) + ' — click to change';
+}
+
+// ---- draggable gutters --------------------------------------------------
+function addGutter(el, g, sizes) {
+  const d = document.createElement('div');
+  d.className = 'pane-gutter ' + g.axis;
+  if (g.axis === 'x') { d.style.gridColumn = String(2 * g.at); d.style.gridRow = `${2 * g.from - 1} / ${2 * g.to}`; }
+  else { d.style.gridRow = String(2 * g.at); d.style.gridColumn = `${2 * g.from - 1} / ${2 * g.to}`; }
+  d.addEventListener('pointerdown', (e) => startDrag(e, g, sizes, d));
+  el.appendChild(d);
+}
+let drag = null, dragRaf = 0;
+function startDrag(e, g, sizes, dEl) {
+  e.preventDefault();
+  const rect = $('panes').getBoundingClientRect();
+  const arr = g.axis === 'x' ? sizes.cols : sizes.rows;
+  drag = {
+    axis: g.axis, sizes, dEl, i: g.at, arr,
+    containerPx: g.axis === 'x' ? rect.width : rect.height,
+    startPos: g.axis === 'x' ? e.clientX : e.clientY,
+    a0: arr[g.at - 1], b0: arr[g.at],
+  };
+  dEl.classList.add('dragging');
+  dEl.setPointerCapture && dEl.setPointerCapture(e.pointerId);
+  window.addEventListener('pointermove', onDrag);
+  window.addEventListener('pointerup', endDrag, { once: true });
+}
+function onDrag(e) {
+  if (!drag) return;
+  const pos = drag.axis === 'x' ? e.clientX : e.clientY;
+  const totalFr = drag.arr.reduce((s, v) => s + v, 0);
+  const realPx = drag.containerPx - (drag.arr.length - 1) * GUT - 6; // minus gutters + padding
+  const pxPerFr = realPx / totalFr || 1;
+  const min = 0.15;
+  let df = (pos - drag.startPos) / pxPerFr;
+  df = Math.max(-(drag.a0 - min), Math.min(drag.b0 - min, df));
+  drag.arr[drag.i - 1] = drag.a0 + df;
+  drag.arr[drag.i] = drag.b0 - df;
+  const el = $('panes');
+  if (drag.axis === 'x') el.style.gridTemplateColumns = trackList(drag.sizes.cols);
+  else el.style.gridTemplateRows = trackList(drag.sizes.rows);
+  if (!dragRaf) dragRaf = requestAnimationFrame(() => { dragRaf = 0; refitAll(); });
+}
+function endDrag() {
+  if (!drag) return;
+  drag.dEl.classList.remove('dragging');
+  window.removeEventListener('pointermove', onDrag);
+  drag = null;
+  savePanes();   // sizes live in paneStore[tab].sizes → persisted
+  refitAll();
+}
+function cycleLayout() {
+  const opts = layoutsFor(panes.length);
+  if (opts.length <= 1) return;
+  const i = Math.max(0, opts.indexOf(currentLayout()));
+  setOrient(opts[(i + 1) % opts.length]);
+}
+
+// ---- view: reconcile live panes with the current tab's stored ids -------
+async function applyView() {
+  const ids = tabIds();
+  if (!ids.length) { showEmpty(); return; }
+  $('empty').classList.add('hidden');
+  for (const p of panes.slice()) if (!ids.includes(p.id)) destroyPane(p);
+  for (const id of ids) if (!panes.find((p) => p.id === id)) makePane(id);
+  panes.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+  for (const id of ids) { const p = panes.find((x) => x.id === id); if (p) $('panes').appendChild(p.el); }
+  if (!focusedId || !ids.includes(focusedId)) focusedId = ids[0];
+  layoutPanes();
+  refitAll();
+  updateHeader(); updateConnDot();
+  renderList(lastList);
+}
+function showEmpty(msg) {
+  for (const p of panes.slice()) destroyPane(p);
+  panes = []; focusedId = null;
+  $('empty').classList.remove('hidden');
+  $('empty-msg').textContent = msg || 'No terminal attached to this tab.';
+  $('sicon').textContent = ''; $('title').textContent = 'Power Shell(ed)';
+  $('orientBtn').classList.add('hidden');
+  setConnected(false);
+  renderList(lastList);
+}
+
+// ---- pane operations ----------------------------------------------------
+function addPane(id) {
+  const ids = tabIds().slice();
+  if (ids.includes(id)) { setFocused(id); return; }
+  if (ids.length >= MAX_PANES) { setStatus(`max ${MAX_PANES} panes`); return; }
+  ids.push(id);
+  focusedId = id;
+  setTabRec(ids);
+  applyView();
+}
+function removePane(id) {
+  setTabRec(tabIds().filter((x) => x !== id));
+  applyView();
+}
+function setOrient(o) {
+  const r = tabRec(); if (!r) return;
+  setTabRec(r.ids, o);
+  layoutPanes(); refitAll();
+}
+
+// Repair a stale render when the side panel becomes visible / focused again.
+function repair() { if (panes.length) refitAll(); }
+document.addEventListener('visibilitychange', () => { if (!document.hidden) repair(); });
+window.addEventListener('focus', repair);
+window.addEventListener('resize', refitAll);
+
+// User picks a session (menu click / create) → add it as a pane.
+function selectSession(id) { addPane(id); }
+
+// ---- session list -------------------------------------------------------
+async function refreshList() {
+  let list;
+  try { list = await api('/sessions'); }
+  catch (e) { renderList([]); updateConnDot(); setStatus('server offline — check ⚙ settings & that the server is running'); return; }
+  updateConnDot();
+  // prune dead session ids out of every tab's panes
+  let changed = false;
+  for (const [tid, rec] of Object.entries(paneStore)) {
+    const before = rec.ids.length;
+    rec.ids = rec.ids.filter((sid) => list.some((s) => s.id === sid));
+    if (rec.ids.length !== before) changed = true;
+    if (!rec.ids.length) delete paneStore[tid];
+  }
+  if (changed) { savePanes(); applyView(); }
+  // drop zoom entries for sessions that no longer exist
+  const alive = new Set(list.map((s) => s.id));
+  let zChanged = false;
+  for (const sid of Object.keys(zoomStore)) if (!alive.has(sid)) { delete zoomStore[sid]; zChanged = true; }
+  if (zChanged) saveZoom();
+  lastList = list;
+  renderList(list);
+}
+function renderList(list) {
+  const boundIds = new Set(Object.values(paneStore).flatMap((r) => r.ids || []));
+  const openIds = new Set(tabIds());
+  const hasSessions = list.length > 0;
+  $('sessEmpty').classList.toggle('hidden', hasSessions);
+  $('emptyListEmpty').classList.toggle('hidden', hasSessions);
+  // Same list is shown in the drawer (☰) and directly in the empty state.
+  for (const ul of [$('sessList'), $('emptyList')]) {
+    ul.innerHTML = '';
+    for (const s of list) ul.appendChild(buildSessItem(s, boundIds, openIds));
+  }
+}
+function buildSessItem(s, boundIds, openIds) {
+  const here = openIds.has(s.id);
+  const li = document.createElement('li');
+  li.className = (here ? 'active ' : '') + (s.exited ? 'dead' : '');
+  const pinTag = boundIds.has(s.id) ? '<span class="s-meta" title="open in a tab">📌</span>' : '';
+  li.innerHTML = `
+    <span class="s-dot ${s.exited ? 'dead' : ''}"></span>
+    <span class="s-ic"></span>
+    <span class="s-name"></span>
+    ${pinTag}
+    <span class="s-meta">${s.shellId}${s.clients ? ' · ' + s.clients + '👁' : ''}</span>
+    <button class="s-kill" title="Kill">✕</button>`;
+  li.querySelector('.s-ic').textContent = s.icon || '';
+  li.querySelector('.s-name').textContent = s.name;
+  li.title = here ? 'Click to remove from this tab' : 'Click to add as a pane in this tab';
+  li.addEventListener('click', (e) => {
+    if (e.target.classList.contains('s-kill')) return;
+    if (here) removePane(s.id); else addPane(s.id);  // toggle in/out of the grid
+  });
+  li.querySelector('.s-kill').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    try { await api(`/sessions/${s.id}`, { method: 'DELETE' }); } catch (_) {}
+    removePane(s.id);   // no-op if it wasn't shown
+    refreshList();
+  });
+  return li;
+}
+
+async function loadShells() {
+  const sel = $('f-shell');
+  try {
+    const shells = await api('/shells');
+    sel.innerHTML = shells.map((s) => `<option value="${s.id}">${s.label}</option>`).join('');
+  } catch (_) { sel.innerHTML = '<option value="powershell">Windows PowerShell</option>'; }
+}
+
+// ---- folder picker (New terminal) ---------------------------------------
+let pickCwd = null;      // selected working dir (abs) or null → server uses home
+let pickCrumbs = [];     // [{name, path}] from workspace root down to current
+let cmdAuto = true;      // keep auto-filling Run-on-start until the user edits it
+let nameAuto = true;     // keep auto-filling the Name field with the RC name
+let contFlag = false;    // append --continue to the generated claude command
+let pickName = '';       // '<slug>-<rand>' — stable per selection, not regenerated on toggle
+let lastNamedPath = null;
+let workspaces = [];     // [{name, path}] user-configured roots (persisted as ct_workspaces)
+
+function saveWorkspaces() { chrome.storage.local.set({ ct_workspaces: workspaces }); }
+// The workspace dropdown in the New-terminal form, filled from user config (local).
+function populateWsDropdown() {
+  const sel = $('f-ws');
+  sel.innerHTML = '';
+  const none = document.createElement('option'); none.value = ''; none.textContent = '— none (home dir) —';
+  sel.appendChild(none);
+  workspaces.forEach((w, i) => {
+    const o = document.createElement('option'); o.value = String(i); o.textContent = w.name; sel.appendChild(o);
+  });
+}
+// Workspace manager (in ⚙ settings): add/remove your own roots.
+function renderWsEditor() {
+  const ul = $('wsList'); ul.innerHTML = '';
+  $('wsEmpty').classList.toggle('hidden', workspaces.length > 0);
+  workspaces.forEach((w, i) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="s-name"></span><span class="s-meta ws-path"></span><button class="s-kill" title="Remove">✕</button>`;
+    li.querySelector('.s-name').textContent = w.name;
+    li.querySelector('.ws-path').textContent = w.path;
+    li.querySelector('.ws-path').title = w.path;
+    li.querySelector('.s-kill').addEventListener('click', () => {
+      workspaces.splice(i, 1); saveWorkspaces(); renderWsEditor();
+    });
+    ul.appendChild(li);
+  });
+}
+
+// RC name for a folder: '<slug>-<rand>' so remote-control names don't collide.
+function makeName(dir) {
+  const base = dir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'session';
+  const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'session';
+  return `${slug}-${Math.floor(Math.random() * 900) + 100}`;
+}
+// The "claude" launch command: opus model + remote-control, optional --continue.
+function buildCmd() {
+  if (!pickCwd) return '';
+  return `claude --model claude-opus-4-8 --remote-control --name ${pickName}${contFlag ? ' --continue' : ''}`;
+}
+
+function updateCwd() {
+  pickCwd = pickCrumbs.length ? pickCrumbs[pickCrumbs.length - 1].path : null;
+  $('f-browser').classList.toggle('hidden', !pickCwd);
+  $('f-cwd-label').textContent = pickCwd || '(home)';
+  // Regenerate the RC name only when the selected path actually changes (so the
+  // --continue toggle keeps the same random suffix).
+  if (pickCwd && pickCwd !== lastNamedPath) { pickName = makeName(pickCwd); lastNamedPath = pickCwd; }
+  if (!pickCwd) { pickName = ''; lastNamedPath = null; }
+  if (cmdAuto) $('f-cmd').value = buildCmd();
+  if (nameAuto) $('f-name').value = pickName;   // Name mirrors the RC name (e.g. mdgraphs-481)
+}
+function renderCrumbs() {
+  const c = $('f-crumbs'); c.innerHTML = '';
+  pickCrumbs.forEach((cr, i) => {
+    if (i) { const s = document.createElement('span'); s.className = 'sep'; s.textContent = '›'; c.appendChild(s); }
+    const b = document.createElement('button'); b.textContent = cr.name; b.title = cr.path;
+    b.addEventListener('click', () => jumpCrumb(i));
+    c.appendChild(b);
+  });
+}
+async function loadDirs() {
+  const ul = $('f-dirs'); ul.innerHTML = '';
+  const empty = $('f-dirs-empty'); empty.classList.add('hidden');
+  const root = pickCrumbs[0] ? pickCrumbs[0].path : pickCwd;
+  let data;
+  try { data = await api('/dirs?path=' + encodeURIComponent(pickCwd) + '&root=' + encodeURIComponent(root)); }
+  catch (e) {
+    const m = String(e.message || '');
+    empty.textContent = m.startsWith('404')
+      ? 'Server is out of date — restart it (start-server.ps1).'
+      : 'Cannot read this folder' + (m ? ' — ' + m : '') + '.';
+    empty.classList.remove('hidden'); return;
+  }
+  if (!data.dirs.length) { empty.textContent = 'No subfolders here.'; empty.classList.remove('hidden'); return; }
+  for (const d of data.dirs) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="d-ic">📁</span><span class="d-name"></span><span class="d-into">›</span>`;
+    li.querySelector('.d-name').textContent = d.name;
+    li.addEventListener('click', () => descend(d));
+    ul.appendChild(li);
+  }
+}
+async function refreshBrowser() { renderCrumbs(); updateCwd(); await loadDirs(); }
+async function descend(d) { pickCrumbs.push({ name: d.name, path: d.path }); await refreshBrowser(); }
+async function jumpCrumb(i) { pickCrumbs = pickCrumbs.slice(0, i + 1); await refreshBrowser(); }
+function resetPicker() {
+  pickCrumbs = [];
+  $('f-crumbs').innerHTML = ''; $('f-dirs').innerHTML = '';
+  $('f-dirs-empty').classList.add('hidden');
+  updateCwd();
+}
+$('f-ws').addEventListener('change', async () => {
+  const sel = $('f-ws');
+  if (sel.value === '') { resetPicker(); return; }
+  const w = workspaces[Number(sel.value)];
+  if (!w) { resetPicker(); return; }
+  pickCrumbs = [{ name: w.name, path: w.path }];
+  await refreshBrowser();
+});
+$('f-cmd').addEventListener('input', () => { cmdAuto = false; });
+$('f-name').addEventListener('input', () => { nameAuto = false; });
+$('f-cont').addEventListener('change', () => {
+  contFlag = $('f-cont').checked;
+  if (cmdAuto) $('f-cmd').value = buildCmd();
+});
+
+// ---- emoji picker (icon field) ------------------------------------------
+const EMOJIS = ['🖥️','💻','⌨️','🐚','⚡','🔧','🛠️','🚀','🔥','🐍','📦','🗄️','🧠','🤖','⚙️','📁',
+  '🌐','🔌','🧪','🐳','🦊','🐙','✨','💾','🧩','🎯','🏗️','📡','🔬','💡','🎨','🕹️','🧰','📊','🔒','🌩️',
+  '🪄','🧵','📝','🔗','🏷️','🧭','🛰️','🦾'];
+function buildEmojiPop() {
+  const pop = $('emojiPop');
+  if (pop.childElementCount) return;
+  for (const e of EMOJIS) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'emoji'; b.textContent = e;
+    b.addEventListener('click', () => { $('f-icon').value = e; pop.classList.add('hidden'); });
+    pop.appendChild(b);
+  }
+}
+function openEmojiPop() { buildEmojiPop(); $('emojiPop').classList.remove('hidden'); }
+$('f-icon').addEventListener('click', openEmojiPop);
+$('f-icon').addEventListener('focus', openEmojiPop);
+document.addEventListener('click', (e) => {
+  const pop = $('emojiPop');
+  if (pop.classList.contains('hidden')) return;
+  if (e.target === $('f-icon') || pop.contains(e.target)) return;
+  pop.classList.add('hidden');
+});
+
+// ---- panels -------------------------------------------------------------
+function hidePanels() { for (const p of ['drawer', 'newForm', 'cfgForm']) $(p).classList.add('hidden'); refitAll(); }
+function toggle(id) {
+  const el = $(id); const wasHidden = el.classList.contains('hidden');
+  hidePanels(); if (wasHidden) el.classList.remove('hidden');
+  refitAll();
+}
+
+// ---- wire up ------------------------------------------------------------
+$('menuBtn').addEventListener('click', () => { toggle('drawer'); refreshList(); });
+$('orientBtn').addEventListener('click', cycleLayout);
+$('cfgBtn').addEventListener('click', () => {
+  $('c-host').value = cfg.host; $('c-port').value = cfg.port;
+  $('c-token').value = cfg.token;
+  renderWsEditor();
+  toggle('cfgForm');
+});
+$('ws-add').addEventListener('click', () => {
+  const name = $('ws-name').value.trim();
+  const path = $('ws-path').value.trim();
+  if (!name || !path) { setStatus('workspace needs a name and a path'); return; }
+  workspaces.push({ name, path });
+  saveWorkspaces(); renderWsEditor(); populateWsDropdown();
+  $('ws-name').value = ''; $('ws-path').value = '';
+});
+function openNewForm() {
+  loadShells(); populateWsDropdown();
+  $('f-icon').value = ''; $('f-ws').value = '';
+  $('f-cont').checked = false; $('emojiPop').classList.add('hidden');
+  cmdAuto = true; nameAuto = true; contFlag = false;
+  resetPicker();                          // clears cwd + Name + Run-on-start
+  hidePanels(); $('newForm').classList.remove('hidden');
+}
+$('newBtn').addEventListener('click', openNewForm);
+$('empty-new').addEventListener('click', openNewForm);
+$('tabBtn').addEventListener('click', () => { chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel.html') }); });
+
+$('f-cancel').addEventListener('click', hidePanels);
+$('f-create').addEventListener('click', async () => {
+  const body = {
+    name: $('f-name').value, icon: $('f-icon').value.trim() || undefined,
+    shellId: $('f-shell').value,
+    cwd: pickCwd || undefined,
+    initialCommand: $('f-cmd').value.trim() || undefined,
+  };
+  try {
+    const s = await api('/sessions', { method: 'POST', body: JSON.stringify(body) });
+    $('f-name').value = ''; $('f-cmd').value = ''; $('f-icon').value = ''; $('f-ws').value = '';
+    $('f-cont').checked = false;
+    cmdAuto = true; nameAuto = true; contFlag = false; resetPicker();
+    hidePanels(); selectSession(s.id);
+  } catch (e) { setStatus('create failed: ' + e.message); }
+});
+
+$('c-cancel').addEventListener('click', hidePanels);
+$('c-save').addEventListener('click', () => {
+  cfg = {
+    host: $('c-host').value.trim() || '127.0.0.1',
+    port: $('c-port').value.trim() || '3777',
+    token: $('c-token').value.trim(),
+  };
+  saveCfg(); hidePanels();
+  refreshList();
+});
+
+// ---- boot ---------------------------------------------------------------
+(async function boot() {
+  await loadState();
+  await initTab();
+  await refreshList();
+  applyView();
+  if (!cfg.token) setStatus('no token set — open ⚙ and paste the server token');
+  setInterval(() => {
+    const drawerOpen = !$('drawer').classList.contains('hidden');
+    const emptyShown = !$('empty').classList.contains('hidden');
+    if (drawerOpen || emptyShown) refreshList();
+  }, 3000);
+})();
