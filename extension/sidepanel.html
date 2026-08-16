@@ -33,7 +33,6 @@
         <label style="flex:0 0 64px">Icon <input id="f-icon" maxlength="4" placeholder="🖥️" readonly /></label>
         <label style="flex:1 1 auto">Name <input id="f-name" placeholder="e.g. claude viclix" /></label>
       </div>
-      <div id="emojiPop" class="emoji-pop hidden"></div>
       <label>Shell <select id="f-shell"></select></label>
       <label>Workspace
         <select id="f-ws"><option value="">— none (home dir) —</option></select>
@@ -98,6 +97,10 @@
     </div>
 
     <div id="status" class="status"></div>
+
+    <!-- floating emoji picker (position:fixed, anchored by JS) — kept OUTSIDE all
+         panels so a hidden (display:none) panel can't suppress its rendering -->
+    <div id="emojiPop" class="emoji-pop hidden"></div>
   </div>
 
   <script src="vendor/xterm.js"></script>

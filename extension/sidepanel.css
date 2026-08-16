@@ -161,6 +161,8 @@ body {
 .chk code { background: var(--bg-panel); padding: 0 4px; border-radius: 3px; color: var(--text); }
 .s-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: 0 0 auto; }
 .s-dot.dead { background: var(--bad); }
+.s-ic { flex: 0 0 auto; cursor: pointer; border-radius: 4px; padding: 1px 3px; line-height: 1; }
+.s-ic:hover { background: var(--bg-hover); }
 .s-name { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .s-meta { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
 .s-kill { background: transparent; border: none; color: var(--kill); cursor: pointer; font-size: 14px; padding: 0 4px; }

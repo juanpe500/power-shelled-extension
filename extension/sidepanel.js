@@ -437,11 +437,17 @@ function buildSessItem(s, boundIds, openIds) {
     ${pinTag}
     <span class="s-meta">${s.shellId}${s.clients ? ' · ' + s.clients + '👁' : ''}</span>
     <button class="s-kill" title="Kill">✕</button>`;
-  li.querySelector('.s-ic').textContent = s.icon || '';
+  const icEl = li.querySelector('.s-ic');
+  icEl.textContent = s.icon || '';
+  icEl.title = 'Change icon';
+  icEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openEmojiPop(icEl, (emoji) => changeSessionIcon(s, emoji || '🖥️'));
+  });
   li.querySelector('.s-name').textContent = s.name;
   li.title = here ? 'Click to remove from this tab' : 'Click to add as a pane in this tab';
   li.addEventListener('click', (e) => {
-    if (e.target.classList.contains('s-kill')) return;
+    if (e.target.classList.contains('s-kill') || e.target.classList.contains('s-ic')) return;
     if (here) removePane(s.id); else addPane(s.id);  // toggle in/out of the grid
   });
   li.querySelector('.s-kill').addEventListener('click', async (e) => {
@@ -452,14 +458,30 @@ function buildSessItem(s, boundIds, openIds) {
   });
   return li;
 }
+// Change the emoji of a running session (rename endpoint), then reflect it in the
+// live pane header, the top bar and the tab-group pill.
+async function changeSessionIcon(s, icon) {
+  try { await api(`/sessions/${s.id}/rename`, { method: 'POST', body: JSON.stringify({ icon }) }); }
+  catch (e) { setStatus('icon change failed: ' + e.message); return; }
+  const p = panes.find((x) => x.id === s.id);
+  if (p) { if (p.meta) p.meta.icon = icon; p.ic.textContent = icon; updateHeader(); }
+  refreshList();   // re-renders lists with the new icon + re-syncs the tab-group titles
+}
 
 // ---- tab-group title (name + emoji in the "PS" pill) --------------------
 // The tab strip pill shows the tab's session(s): 1 → "🖥️ full-name",
-// 2 → "i1i2 rmtn+dnt-b", 3+ → "i1i2i3 Re+DB+VD". sidepanel composes the string
-// (it has names+icons via lastList) and stores it in ct_tabtitle; background.js
-// applies it as the group title. Names drop a trailing numeric segment first.
+// same-named panes collapse to "🖥️ xN full-name" (suffix dropped), and mixed
+// names shorten to "i1i2 rmtn+dnt-b" (3+ → "i1i2i3 Re+DB+VD"), still collapsing
+// dupes as "…xN". sidepanel composes the string (it has names+icons via lastList)
+// and stores it in ct_tabtitle; background.js applies it as the group title.
+// Names drop a trailing numeric segment first.
 function nameWords(name) {
   return String(name || '').split('-').map((s) => s.trim()).filter((s) => s && !/^\d+$/.test(s));
+}
+// Full name without the trailing -xxx suffix: 'chrome-terminal-481' → 'chrome-terminal'.
+function baseName(name) {
+  const w = nameWords(name);
+  return w.length ? w.join('-') : String(name || '').trim();
 }
 function noVowels(s) { return s.replace(/[aeiou]/gi, ''); }
 // medium abbrev (~5 chars): first word devowelled (3 if more words, else 5) + initial of each rest
@@ -480,9 +502,25 @@ function abbrShort(name) {
 function tabTitleFor(ids) {
   const meta = ids.map((id) => lastList.find((s) => s.id === id)).filter(Boolean);
   if (!meta.length) return null;
-  const icons = meta.map((m) => m.icon || '').join('');
   if (meta.length === 1) return `${meta[0].icon || ''} ${meta[0].name}`.trim();
-  const abbr = meta.map((m) => (meta.length === 2 ? abbrMed(m.name) : abbrShort(m.name)));
+  // Collapse same-named sessions (ignoring the -xxx suffix) into "name xN".
+  const groups = [];
+  for (const m of meta) {
+    const b = baseName(m.name);
+    const g = groups.find((x) => x.base === b);
+    if (g) g.count++; else groups.push({ base: b, count: 1, icon: m.icon || '' });
+  }
+  // All the same name → count before the full base name, e.g. "🖥️ x2 chrome-terminal".
+  if (groups.length === 1) {
+    const g = groups[0];
+    return `${g.icon} ${g.count > 1 ? 'x' + g.count + ' ' : ''}${g.base}`.trim();
+  }
+  // Mixed names → compact abbreviations, still collapsing duplicates (e.g. "rmtnx2+dnt").
+  const icons = groups.map((g) => g.icon).join('');
+  const abbr = groups.map((g) => {
+    const a = groups.length === 2 ? abbrMed(g.base) : abbrShort(g.base);
+    return g.count > 1 ? `${a}x${g.count}` : a;
+  });
   return `${icons} ${abbr.join('+')}`;
 }
 let tabTitleCache = '';
@@ -800,6 +838,7 @@ $('f-create').addEventListener('click', async () => {
     $('f-name').value = ''; $('f-cmd').value = ''; $('f-icon').value = ''; $('f-ws').value = '';
     $('f-cont').checked = false;
     cmdAuto = true; nameAuto = true; contFlag = false; resetPicker();
+    await refreshList();          // pull the new session into lastList so the tab-group title resolves now, not on next drawer open
     hidePanels(); selectSession(s.id);
   } catch (e) { setStatus('create failed: ' + e.message); }
 });
