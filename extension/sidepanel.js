@@ -33,10 +33,11 @@ async function api(path, opts = {}) {
 // ---- storage ------------------------------------------------------------
 function loadState() {
   return new Promise((res) => {
-    chrome.storage.local.get(['ct_cfg', 'ct_panes', 'ct_bindings', 'ct_zoom', 'ct_workspaces'], (o) => {
+    chrome.storage.local.get(['ct_cfg', 'ct_panes', 'ct_bindings', 'ct_zoom', 'ct_workspaces', 'ct_favorites'], (o) => {
       if (o.ct_cfg) cfg = { ...DEFAULTS, ...o.ct_cfg };
       zoomStore = o.ct_zoom || {};
       workspaces = o.ct_workspaces || [];
+      favorites = o.ct_favorites || [];
       if (o.ct_panes) paneStore = o.ct_panes;
       else if (o.ct_bindings) {                 // migrate old one-session-per-tab format
         paneStore = {};
@@ -86,6 +87,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes.ct_panes) { paneStore = changes.ct_panes.newValue || {}; applyView(); renderList(lastList); }
   if (changes.ct_workspaces) { workspaces = changes.ct_workspaces.newValue || []; populateWsDropdown(); renderWsEditor(); }
+  if (changes.ct_favorites) { favorites = changes.ct_favorites.newValue || []; renderFavList(); updateFavStar(); }
 });
 
 // ---- panes (multi-terminal grid) ----------------------------------------
@@ -345,6 +347,7 @@ async function applyView() {
   refitAll();
   updateHeader(); updateConnDot();
   renderList(lastList);
+  syncTabTitles();
 }
 function showEmpty(msg) {
   for (const p of panes.slice()) destroyPane(p);
@@ -408,6 +411,7 @@ async function refreshList() {
   if (zChanged) saveZoom();
   lastList = list;
   renderList(list);
+  syncTabTitles();   // names/icons may have changed → refresh the tab-group pills
 }
 function renderList(list) {
   const boundIds = new Set(Object.values(paneStore).flatMap((r) => r.ids || []));
@@ -449,6 +453,52 @@ function buildSessItem(s, boundIds, openIds) {
   return li;
 }
 
+// ---- tab-group title (name + emoji in the "PS" pill) --------------------
+// The tab strip pill shows the tab's session(s): 1 → "🖥️ full-name",
+// 2 → "i1i2 rmtn+dnt-b", 3+ → "i1i2i3 Re+DB+VD". sidepanel composes the string
+// (it has names+icons via lastList) and stores it in ct_tabtitle; background.js
+// applies it as the group title. Names drop a trailing numeric segment first.
+function nameWords(name) {
+  return String(name || '').split('-').map((s) => s.trim()).filter((s) => s && !/^\d+$/.test(s));
+}
+function noVowels(s) { return s.replace(/[aeiou]/gi, ''); }
+// medium abbrev (~5 chars): first word devowelled (3 if more words, else 5) + initial of each rest
+function abbrMed(name) {
+  const w = nameWords(name);
+  if (!w.length) return String(name || '').slice(0, 5).toLowerCase();
+  if (w.length === 1) return (noVowels(w[0]) || w[0]).slice(0, 5).toLowerCase();
+  const head = (noVowels(w[0]) || w[0]).slice(0, 3).toLowerCase();
+  return [head, ...w.slice(1).map((s) => s[0].toLowerCase())].join('-');
+}
+// short abbrev (2 chars): initials of first two words uppercased, or first two letters titlecased
+function abbrShort(name) {
+  const w = nameWords(name);
+  if (!w.length) { const s = String(name || '?'); return (s[0] || '?').toUpperCase() + (s[1] || '').toLowerCase(); }
+  if (w.length === 1) return w[0].charAt(0).toUpperCase() + (w[0].charAt(1) || '').toLowerCase();
+  return (w[0][0] + w[1][0]).toUpperCase();
+}
+function tabTitleFor(ids) {
+  const meta = ids.map((id) => lastList.find((s) => s.id === id)).filter(Boolean);
+  if (!meta.length) return null;
+  const icons = meta.map((m) => m.icon || '').join('');
+  if (meta.length === 1) return `${meta[0].icon || ''} ${meta[0].name}`.trim();
+  const abbr = meta.map((m) => (meta.length === 2 ? abbrMed(m.name) : abbrShort(m.name)));
+  return `${icons} ${abbr.join('+')}`;
+}
+let tabTitleCache = '';
+function syncTabTitles() {
+  const titles = {};
+  for (const [t, rec] of Object.entries(paneStore)) {
+    if (!rec || !rec.ids || !rec.ids.length) continue;
+    const title = tabTitleFor(rec.ids);
+    if (title) titles[t] = title;
+  }
+  const j = JSON.stringify(titles);
+  if (j === tabTitleCache) return;
+  tabTitleCache = j;
+  chrome.storage.local.set({ ct_tabtitle: titles });
+}
+
 async function loadShells() {
   const sel = $('f-shell');
   try {
@@ -465,9 +515,88 @@ let nameAuto = true;     // keep auto-filling the Name field with the RC name
 let contFlag = false;    // append --continue to the generated claude command
 let pickName = '';       // '<slug>-<rand>' — stable per selection, not regenerated on toggle
 let lastNamedPath = null;
+let favPick = false;     // a favorite is the current selection → keep the subfolder browser hidden
 let workspaces = [];     // [{name, path}] user-configured roots (persisted as ct_workspaces)
+let favorites = [];      // [{path, crumbs:[{name,path}]}] saved folders (persisted as ct_favorites)
 
 function saveWorkspaces() { chrome.storage.local.set({ ct_workspaces: workspaces }); }
+
+// ---- favorites (saved folders in the New-terminal form) -----------------
+function saveFavorites() { chrome.storage.local.set({ ct_favorites: favorites }); }
+function favNorm(p) { return (p || '').replace(/[\\/]+$/, '').toLowerCase(); }
+function favIndex(path) { const k = favNorm(path); return favorites.findIndex((f) => favNorm(f.path) === k); }
+// Restore workspace + drill-down for a saved favorite so its folder is the cwd,
+// no manual navigation needed. Handles nested paths (e.g. VICLIX › dashboard).
+function applyFav(fav) {
+  pickCrumbs = fav.crumbs.map((c) => ({ name: c.name, path: c.path }));
+  // Reflect the root in the workspace dropdown when it matches a configured one.
+  const root = pickCrumbs[0] ? favNorm(pickCrumbs[0].path) : '';
+  const wi = workspaces.findIndex((w) => favNorm(w.path) === root);
+  $('f-ws').value = wi >= 0 ? String(wi) : '';
+  // A favorite is a direct pick — don't open the subfolder browser (that's only
+  // for navigating a workspace); just set the cwd + auto Name/Run-on-start.
+  favPick = true;
+  updateCwd();
+  // Restore the icon saved with this favorite so it doesn't have to be set again.
+  $('f-icon').value = fav.icon || '';
+}
+function renderFavList() {
+  const ul = $('f-fav-list'); if (!ul) return;
+  ul.innerHTML = '';
+  $('f-fav-empty').classList.toggle('hidden', favorites.length > 0);
+  favorites.forEach((fav, i) => {
+    const tip = fav.crumbs[fav.crumbs.length - 1];
+    const trail = fav.crumbs.map((c) => c.name).join(' › ');
+    const li = document.createElement('li');
+    if (favPick && favNorm(fav.path) === favNorm(pickCwd)) li.className = 'active';
+    li.innerHTML = `<span class="d-ic"></span><span class="fav-name"></span><span class="fav-trail"></span>` +
+      `<button class="fav-ic-btn" title="Set the icon for this favorite">🎨</button>` +
+      `<button class="s-kill" title="Remove favorite">✕</button>`;
+    li.querySelector('.d-ic').textContent = fav.icon || '⭐';
+    li.querySelector('.fav-name').textContent = tip ? tip.name : fav.path;
+    li.querySelector('.fav-trail').textContent = trail;
+    li.title = fav.path;
+    li.addEventListener('click', (e) => { if (e.target.closest('button')) return; applyFav(fav); });
+    li.querySelector('.fav-ic-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openEmojiPop(e.currentTarget, (emoji) => {
+        if (emoji) fav.icon = emoji; else delete fav.icon;
+        saveFavorites(); renderFavList();
+        // if this favorite is the current pick, reflect its icon in the form field
+        if (favPick && favNorm(fav.path) === favNorm(pickCwd)) $('f-icon').value = fav.icon || '';
+      });
+    });
+    li.querySelector('.s-kill').addEventListener('click', (e) => {
+      e.stopPropagation();
+      favorites.splice(i, 1); saveFavorites(); renderFavList(); updateFavStar();
+    });
+    ul.appendChild(li);
+  });
+}
+function toggleFav() {
+  if (!pickCwd) return;
+  const i = favIndex(pickCwd);
+  if (i >= 0) favorites.splice(i, 1);
+  else favorites.push({ path: pickCwd, crumbs: pickCrumbs.map((c) => ({ name: c.name, path: c.path })) });
+  saveFavorites(); renderFavList(); updateFavStar();
+}
+// Favorite a subfolder straight from the dir list, without descending into it.
+function toggleFavDir(d) {
+  const i = favIndex(d.path);
+  if (i >= 0) favorites.splice(i, 1);
+  else favorites.push({
+    path: d.path,
+    crumbs: [...pickCrumbs.map((c) => ({ name: c.name, path: c.path })), { name: d.name, path: d.path }],
+  });
+  saveFavorites(); renderFavList(); updateFavStar(); loadDirs();
+}
+function updateFavStar() {
+  const star = $('f-fav-star'); if (!star) return;
+  const on = !!pickCwd && favIndex(pickCwd) >= 0;
+  star.textContent = on ? '★' : '☆';
+  star.classList.toggle('on', on);
+  star.title = on ? 'Remove this folder from favorites' : 'Save this folder as a favorite';
+}
 // The workspace dropdown in the New-terminal form, filled from user config (local).
 function populateWsDropdown() {
   const sel = $('f-ws');
@@ -509,7 +638,7 @@ function buildCmd() {
 
 function updateCwd() {
   pickCwd = pickCrumbs.length ? pickCrumbs[pickCrumbs.length - 1].path : null;
-  $('f-browser').classList.toggle('hidden', !pickCwd);
+  $('f-browser').classList.toggle('hidden', !pickCwd || favPick);
   $('f-cwd-label').textContent = pickCwd || '(home)';
   // Regenerate the RC name only when the selected path actually changes (so the
   // --continue toggle keeps the same random suffix).
@@ -517,6 +646,7 @@ function updateCwd() {
   if (!pickCwd) { pickName = ''; lastNamedPath = null; }
   if (cmdAuto) $('f-cmd').value = buildCmd();
   if (nameAuto) $('f-name').value = pickName;   // Name mirrors the RC name (e.g. mdgraphs-481)
+  updateFavStar(); renderFavList();             // keep star + active favorite highlight in sync
 }
 function renderCrumbs() {
   const c = $('f-crumbs'); c.innerHTML = '';
@@ -543,8 +673,12 @@ async function loadDirs() {
   if (!data.dirs.length) { empty.textContent = 'No subfolders here.'; empty.classList.remove('hidden'); return; }
   for (const d of data.dirs) {
     const li = document.createElement('li');
-    li.innerHTML = `<span class="d-ic">📁</span><span class="d-name"></span><span class="d-into">›</span>`;
+    const on = favIndex(d.path) >= 0;
+    li.innerHTML = `<span class="d-ic">📁</span><span class="d-name"></span>` +
+      `<button class="fav-star${on ? ' on' : ''}" title="Favorite this folder">${on ? '★' : '☆'}</button>` +
+      `<span class="d-into">›</span>`;
     li.querySelector('.d-name').textContent = d.name;
+    li.querySelector('.fav-star').addEventListener('click', (e) => { e.stopPropagation(); toggleFavDir(d); });
     li.addEventListener('click', () => descend(d));
     ul.appendChild(li);
   }
@@ -553,7 +687,7 @@ async function refreshBrowser() { renderCrumbs(); updateCwd(); await loadDirs();
 async function descend(d) { pickCrumbs.push({ name: d.name, path: d.path }); await refreshBrowser(); }
 async function jumpCrumb(i) { pickCrumbs = pickCrumbs.slice(0, i + 1); await refreshBrowser(); }
 function resetPicker() {
-  pickCrumbs = [];
+  pickCrumbs = []; favPick = false;
   $('f-crumbs').innerHTML = ''; $('f-dirs').innerHTML = '';
   $('f-dirs-empty').classList.add('hidden');
   updateCwd();
@@ -563,9 +697,10 @@ $('f-ws').addEventListener('change', async () => {
   if (sel.value === '') { resetPicker(); return; }
   const w = workspaces[Number(sel.value)];
   if (!w) { resetPicker(); return; }
-  pickCrumbs = [{ name: w.name, path: w.path }];
+  pickCrumbs = [{ name: w.name, path: w.path }]; favPick = false;
   await refreshBrowser();
 });
+$('f-fav-star').addEventListener('click', toggleFav);
 $('f-cmd').addEventListener('input', () => { cmdAuto = false; });
 $('f-name').addEventListener('input', () => { nameAuto = false; });
 $('f-cont').addEventListener('change', () => {
@@ -577,23 +712,41 @@ $('f-cont').addEventListener('change', () => {
 const EMOJIS = ['🖥️','💻','⌨️','🐚','⚡','🔧','🛠️','🚀','🔥','🐍','📦','🗄️','🧠','🤖','⚙️','📁',
   '🌐','🔌','🧪','🐳','🦊','🐙','✨','💾','🧩','🎯','🏗️','📡','🔬','💡','🎨','🕹️','🧰','📊','🔒','🌩️',
   '🪄','🧵','📝','🔗','🏷️','🧭','🛰️','🦾'];
+let emojiHandler = null;    // (emoji) => void — where the next pick is delivered
+let emojiAnchor = null;     // element the pop is floating under (kept open on its click)
 function buildEmojiPop() {
   const pop = $('emojiPop');
   if (pop.childElementCount) return;
+  const clear = document.createElement('button');
+  clear.type = 'button'; clear.className = 'emoji emoji-clear'; clear.textContent = '∅'; clear.title = 'No icon';
+  clear.addEventListener('click', () => { if (emojiHandler) emojiHandler(''); pop.classList.add('hidden'); });
+  pop.appendChild(clear);
   for (const e of EMOJIS) {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'emoji'; b.textContent = e;
-    b.addEventListener('click', () => { $('f-icon').value = e; pop.classList.add('hidden'); });
+    b.addEventListener('click', () => { if (emojiHandler) emojiHandler(e); pop.classList.add('hidden'); });
     pop.appendChild(b);
   }
 }
-function openEmojiPop() { buildEmojiPop(); $('emojiPop').classList.remove('hidden'); }
-$('f-icon').addEventListener('click', openEmojiPop);
-$('f-icon').addEventListener('focus', openEmojiPop);
+// Float the picker under `anchor`; each pick is routed to `handler`.
+function openEmojiPop(anchor, handler) {
+  buildEmojiPop();
+  emojiHandler = handler || ((e) => { $('f-icon').value = e; });
+  emojiAnchor = anchor;
+  const pop = $('emojiPop');
+  pop.classList.remove('hidden');
+  const r = anchor.getBoundingClientRect();
+  const pw = pop.offsetWidth || 240;
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - pw - 8));
+  pop.style.left = left + 'px';
+  pop.style.top = (r.bottom + 4) + 'px';
+}
+$('f-icon').addEventListener('click', () => openEmojiPop($('f-icon')));
+$('f-icon').addEventListener('focus', () => openEmojiPop($('f-icon')));
 document.addEventListener('click', (e) => {
   const pop = $('emojiPop');
   if (pop.classList.contains('hidden')) return;
-  if (e.target === $('f-icon') || pop.contains(e.target)) return;
+  if (e.target === emojiAnchor || pop.contains(e.target)) return;
   pop.classList.add('hidden');
 });
 
@@ -623,7 +776,7 @@ $('ws-add').addEventListener('click', () => {
   $('ws-name').value = ''; $('ws-path').value = '';
 });
 function openNewForm() {
-  loadShells(); populateWsDropdown();
+  loadShells(); populateWsDropdown(); renderFavList();
   $('f-icon').value = ''; $('f-ws').value = '';
   $('f-cont').checked = false; $('emojiPop').classList.add('hidden');
   cmdAuto = true; nameAuto = true; contFlag = false;

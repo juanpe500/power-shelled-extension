@@ -38,11 +38,18 @@
       <label>Workspace
         <select id="f-ws"><option value="">— none (home dir) —</option></select>
       </label>
+      <div id="f-favs" class="favs">
+        <div class="favs-h">Favorites</div>
+        <ul id="f-fav-list" class="sess-list favlist"></ul>
+        <div class="hint" id="f-fav-empty">No favorites yet — open a folder below and tap ☆ to save it.</div>
+      </div>
       <div id="f-browser" class="browser hidden">
         <div id="f-crumbs" class="crumbs"></div>
         <ul id="f-dirs" class="sess-list dirlist"></ul>
         <div id="f-dirs-empty" class="hint">No subfolders here.</div>
-        <div class="cwd-pick">📁 <span id="f-cwd-label"></span></div>
+        <div class="cwd-pick">📁 <span id="f-cwd-label"></span>
+          <button id="f-fav-star" class="fav-star" title="Save this folder as a favorite">☆</button>
+        </div>
       </div>
       <label>Run on start <input id="f-cmd" placeholder="e.g. cc viclix" /></label>
       <label class="chk"><input type="checkbox" id="f-cont" /> Continue previous session (<code>--continue</code>)</label>

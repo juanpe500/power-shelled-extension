@@ -32,21 +32,30 @@ chrome.action.onClicked.addListener((tab) => {
 
 // ---- tab group indicator (like the "Claude" pill) -----------------------
 // A tab that has ≥1 terminal pane (sidepanel.js -> ct_panes[tab].ids) is put in a
-// colored tab group named "PS". This marks in the tab strip which tabs own a
-// terminal — and it PERSISTS while the side panel is closed, since the panes
-// persist. Emptying a tab's panes (kill/close all) ungroups the tab.
+// colored tab group. The group TITLE shows the tab's session(s) — name + emoji,
+// composed by sidepanel.js and stored in ct_tabtitle (e.g. "🖥️ remotion-882" for
+// one, "🖥️🐍 rmtn+dnt-b" for two, "🖥️🐍⚡ Re+DB+VD" for 3+). Falls back to "PS".
+// Marks in the tab strip which tabs own a terminal, and PERSISTS while the side
+// panel is closed. Emptying a tab's panes (kill/close all) ungroups the tab.
 const GROUP_TITLE = 'PS';
 const GROUP_COLOR = 'orange';
+let tabTitles = {};   // { tabId: composed title } mirror of ct_tabtitle
+
+function titleFor(tabId) { return tabTitles[tabId] || GROUP_TITLE; }
 
 async function ensureGrouped(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
+    const want = titleFor(tabId);
     if (tab.groupId && tab.groupId !== -1) {
       const g = await chrome.tabGroups.get(tab.groupId);
-      if (g.title === GROUP_TITLE) return; // already in a PS group
+      if (g.color === GROUP_COLOR) {   // one of ours → just keep the title current
+        if (g.title !== want) await chrome.tabGroups.update(tab.groupId, { title: want });
+        return;
+      }
     }
     const gid = await chrome.tabs.group({ tabIds: [tabId] });
-    await chrome.tabGroups.update(gid, { title: GROUP_TITLE, color: GROUP_COLOR });
+    await chrome.tabGroups.update(gid, { title: want, color: GROUP_COLOR });
   } catch (_) {}
 }
 async function ungroup(tabId) {
@@ -62,19 +71,29 @@ function tabsWithPanes(store) {
   return set;
 }
 
-// React to pane changes written by the side panel.
+// React to pane / title changes written by the side panel.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area !== 'local' || !changes.ct_panes) return;
-  const oldTabs = tabsWithPanes(changes.ct_panes.oldValue);
-  const newTabs = tabsWithPanes(changes.ct_panes.newValue);
-  for (const t of newTabs) if (!oldTabs.has(t)) ensureGrouped(t);
-  for (const t of oldTabs) if (!newTabs.has(t)) ungroup(t);
+  if (area !== 'local') return;
+  if (changes.ct_tabtitle) {
+    const prev = tabTitles;
+    tabTitles = changes.ct_tabtitle.newValue || {};
+    // re-title any grouped tab whose composed title changed
+    const ids = new Set([...Object.keys(prev), ...Object.keys(tabTitles)]);
+    for (const id of ids) if (prev[id] !== tabTitles[id]) ensureGrouped(Number(id));
+  }
+  if (changes.ct_panes) {
+    const oldTabs = tabsWithPanes(changes.ct_panes.oldValue);
+    const newTabs = tabsWithPanes(changes.ct_panes.newValue);
+    for (const t of newTabs) if (!oldTabs.has(t)) ensureGrouped(t);
+    for (const t of oldTabs) if (!newTabs.has(t)) ungroup(t);
+  }
 });
 
 // On SW start, re-apply groups for tabs (with panes) that still exist.
 async function reconcileGroups() {
   try {
-    const { ct_panes } = await chrome.storage.local.get('ct_panes');
+    const { ct_panes, ct_tabtitle } = await chrome.storage.local.get(['ct_panes', 'ct_tabtitle']);
+    tabTitles = ct_tabtitle || {};
     for (const id of tabsWithPanes(ct_panes)) {
       try { await chrome.tabs.get(id); } catch (_) { continue; }
       ensureGrouped(id);
