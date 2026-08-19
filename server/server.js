@@ -424,6 +424,69 @@ app.get('/dirs', (req, res) => {
   res.json({ path: rp, dirs });
 });
 
+// ---- conversations (New-terminal Resume picker) -------------------------
+// Read the TAIL of a transcript .jsonl and pull the last human prompt + last
+// assistant reply, so the popup can preview each past session for a folder.
+const TAIL_BYTES = 256 * 1024;
+const SNIP = 400;
+function readTranscriptTail(file) {
+  let fd;
+  try {
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - TAIL_BYTES);
+    const len = size - start;
+    const buf = Buffer.alloc(len);
+    fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buf, 0, len, start);
+    let text = buf.toString('utf8');
+    // If we started mid-file, the first line is partial — drop it.
+    if (start > 0) { const nl = text.indexOf('\n'); if (nl >= 0) text = text.slice(nl + 1); }
+    const lines = text.split('\n');
+    let lastUser = '', lastAssistant = '';
+    for (let i = lines.length - 1; i >= 0 && (!lastUser || !lastAssistant); i--) {
+      const raw = lines[i].trim();
+      if (!raw) continue;
+      let o; try { o = JSON.parse(raw); } catch (_) { continue; }
+      if (o.isSidechain === true || !o.message) continue;   // skip subagent turns
+      if (!lastAssistant && o.type === 'assistant' && Array.isArray(o.message.content)) {
+        const t = o.message.content.filter(b => b && b.type === 'text' && b.text).map(b => b.text).join(' ').trim();
+        if (t) lastAssistant = t.slice(0, SNIP);
+      } else if (!lastUser && o.type === 'user' && typeof o.message.content === 'string') {
+        const t = o.message.content.trim();     // real human prompts are plain strings
+        if (t && !t.startsWith('<')) lastUser = t.slice(0, SNIP);   // skip tool_result / <…> wrappers
+      }
+    }
+    return { lastUser, lastAssistant };
+  } catch (_) {
+    return { lastUser: '', lastAssistant: '' };
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch (_) {} }
+  }
+}
+// List past conversations (transcripts) for a folder, newest first, so the user
+// can resume one by its uuid. Reads ~/.claude/projects/<cwd>/*.jsonl on demand.
+app.get('/conversations', (req, res) => {
+  const cwd = String(req.query.cwd || '');
+  if (!cwd) return res.status(400).json({ error: 'cwd required' });
+  const dir = projectDirFor(cwd);
+  let files;
+  try { files = fs.readdirSync(dir); } catch (_) { return res.json([]); }
+  const liveUuids = new Set(
+    [...sessions.values()].filter(s => !s.exited && s.claudeUuid).map(s => s.claudeUuid)
+  );
+  const items = files.filter(f => f.endsWith('.jsonl')).map(f => {
+    const full = path.join(dir, f);
+    let mtime = 0, size = 0;
+    try { const st = fs.statSync(full); mtime = st.mtimeMs; size = st.size; } catch (_) {}
+    return { uuid: f.slice(0, -6), full, mtime, size };
+  }).sort((a, b) => b.mtime - a.mtime).slice(0, 20);
+  const out = items.map(it => {
+    const { lastUser, lastAssistant } = readTranscriptTail(it.full);
+    return { uuid: it.uuid, mtime: it.mtime, size: it.size, lastUser, lastAssistant, live: liveUuids.has(it.uuid) };
+  });
+  res.json(out);
+});
+
 app.get('/sessions', (_req, res) => {
   res.json([...sessions.values()].map(s => s.meta()));
 });

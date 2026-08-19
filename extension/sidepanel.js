@@ -658,7 +658,7 @@ let pickCwd = null;      // selected working dir (abs) or null → server uses h
 let pickCrumbs = [];     // [{name, path}] from workspace root down to current
 let cmdAuto = true;      // keep auto-filling Run-on-start until the user edits it
 let nameAuto = true;     // keep auto-filling the Name field with the RC name
-let contFlag = false;    // append --continue to the generated claude command
+let resumeUuid = '';     // picked past-session uuid → append --resume <uuid> to the command
 let pickName = '';       // '<slug>-<rand>' — stable per selection, not regenerated on toggle
 let lastNamedPath = null;
 let favPick = false;     // a favorite is the current selection → keep the subfolder browser hidden
@@ -823,7 +823,7 @@ function makeName(dir) {
 // survives the resume.
 function buildCmd() {
   if (!pickCwd) return '';
-  return `claude --model claude-opus-4-8 --remote-control ${pickName}${contFlag ? ' --continue' : ''}`;
+  return `claude --model claude-opus-4-8 --remote-control ${pickName}${resumeUuid ? ' --resume ' + resumeUuid : ''}`;
 }
 
 function updateCwd() {
@@ -887,9 +887,69 @@ function resetPicker() {
 $('f-fav-star').addEventListener('click', toggleFav);
 $('f-cmd').addEventListener('input', () => { cmdAuto = false; });
 $('f-name').addEventListener('input', () => { nameAuto = false; });
-$('f-cont').addEventListener('change', () => {
-  contFlag = $('f-cont').checked;
-  if (cmdAuto) $('f-cmd').value = buildCmd();
+// ---- resume picker: choose a past conversation to --resume --------------
+function relTime(ms) {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function updateResumeTag() {
+  const tag = $('f-resume-tag');
+  if (!resumeUuid) { tag.classList.add('hidden'); tag.innerHTML = ''; return; }
+  tag.classList.remove('hidden');
+  tag.innerHTML = `resuming <b>${escHtml(resumeUuid.slice(0, 8))}</b><button class="resume-clear" title="Cancel resume">✕</button>`;
+  tag.querySelector('.resume-clear').addEventListener('click', () => {
+    resumeUuid = ''; updateResumeTag();
+    if (cmdAuto) $('f-cmd').value = buildCmd();
+  });
+}
+function pickResume(uuid) {
+  resumeUuid = uuid;
+  cmdAuto = true; $('f-cmd').value = buildCmd();   // canonical resume command (--resume must be in it)
+  updateResumeTag();
+  closeResume();
+}
+function closeResume() { $('resumeBackdrop').classList.add('hidden'); }
+async function openResumeModal() {
+  if (!pickCwd) { setStatus('pick a workspace/folder first to resume its sessions'); return; }
+  $('resumeList').innerHTML = '';
+  $('resumeState').textContent = 'Loading…'; $('resumeState').classList.remove('hidden');
+  $('resumeBackdrop').classList.remove('hidden');
+  let convos;
+  try { convos = await api('/conversations?cwd=' + encodeURIComponent(pickCwd)); }
+  catch (e) {
+    const m = String(e.message || '');
+    $('resumeState').textContent = m.startsWith('404')
+      ? 'Server is out of date — restart it to enable resume.'
+      : 'Could not load conversations' + (m ? ' — ' + m : '') + '.';
+    return;
+  }
+  if (!convos.length) { $('resumeState').textContent = 'No past conversations for this folder.'; return; }
+  $('resumeState').classList.add('hidden');
+  const ul = $('resumeList');
+  for (const c of convos) {
+    const li = document.createElement('li');
+    li.className = 'resume-item' + (c.live ? ' disabled' : '');
+    const badge = c.live ? '<span class="resume-badge">· open now</span>' : '';
+    li.innerHTML =
+      `<div class="resume-head"><span class="resume-id">${escHtml(c.uuid.slice(0, 8))}</span>` +
+      `<span class="resume-when">${escHtml(relTime(c.mtime))}${badge}</span></div>` +
+      `<div class="resume-line"><span class="resume-tagname">you</span>${escHtml((c.lastUser || '(no recent prompt)').slice(0, 100))}</div>` +
+      `<div class="resume-line"><span class="resume-tagname ai">ai</span>${escHtml((c.lastAssistant || '(no recent reply)').slice(0, 100))}</div>`;
+    li.title = c.uuid + (c.live ? '\n(already open in a pane)' : '') +
+      (c.lastUser ? '\n\nyou: ' + c.lastUser : '') + (c.lastAssistant ? '\n\nai: ' + c.lastAssistant : '');
+    if (!c.live) li.addEventListener('click', () => pickResume(c.uuid));
+    ul.appendChild(li);
+  }
+}
+$('f-resume').addEventListener('click', openResumeModal);
+$('resumeCancel').addEventListener('click', closeResume);
+$('resumeBackdrop').addEventListener('click', (e) => { if (e.target === $('resumeBackdrop')) closeResume(); });
+document.addEventListener('keydown', (e) => {
+  if ($('resumeBackdrop').classList.contains('hidden')) return;
+  if (e.key === 'Escape') { e.preventDefault(); closeResume(); }
 });
 
 // ---- emoji picker (icon field) ------------------------------------------
@@ -1042,8 +1102,8 @@ function openNewForm() {
   loadShells(); renderFavList();
   wsSel = ''; renderWsChips();
   $('f-icon').value = '';
-  $('f-cont').checked = false; $('emojiPop').classList.add('hidden');
-  cmdAuto = true; nameAuto = true; contFlag = false;
+  $('emojiPop').classList.add('hidden');
+  cmdAuto = true; nameAuto = true; resumeUuid = ''; updateResumeTag();
   resetPicker();                          // clears cwd + Name + Run-on-start
   hidePanels(); $('newForm').classList.remove('hidden'); syncPanelBtns();
 }
@@ -1076,13 +1136,13 @@ $('f-create').addEventListener('click', async () => {
     shellId: $('f-shell').value,
     cwd: pickCwd || undefined,
     initialCommand: $('f-cmd').value.trim() || undefined,
+    claudeUuid: resumeUuid || undefined,   // resuming a past conversation (also in --resume)
   };
   try {
     const s = await api('/sessions', { method: 'POST', body: JSON.stringify(body) });
     $('f-name').value = ''; $('f-cmd').value = ''; $('f-icon').value = '';
     wsSel = ''; renderWsChips();
-    $('f-cont').checked = false;
-    cmdAuto = true; nameAuto = true; contFlag = false; resetPicker();
+    cmdAuto = true; nameAuto = true; resumeUuid = ''; updateResumeTag(); resetPicker();
     await refreshList();          // pull the new session into lastList so the tab-group title resolves now, not on next drawer open
     hidePanels(); selectSession(s.id);
   } catch (e) { setStatus('create failed: ' + e.message); }

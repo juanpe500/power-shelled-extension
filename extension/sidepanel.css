@@ -265,6 +265,43 @@ body {
 .modal-actions button.danger:hover { background: var(--kill-hover); border-color: var(--kill-hover); }
 @keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
 @keyframes modal-pop { from { opacity: 0; transform: translateY(6px) scale(.97); } to { opacity: 1; transform: none; } }
+.modal.modal-wide { max-width: 460px; text-align: left; }
+
+/* resume picker: button + tag in the New-terminal form */
+.resume-row { align-items: center; }
+.resume-tag {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted);
+  padding: 2px 4px 2px 10px; border-radius: 14px; border: 1px solid var(--border); background: var(--bg-elevated);
+}
+.resume-tag b { color: var(--text-bright); font-family: Consolas, monospace; font-weight: 600; }
+.resume-tag.hidden { display: none; }
+.panel button.resume-clear {
+  width: 18px; height: 18px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  border: none; border-radius: 50%; background: transparent; color: var(--text-muted); cursor: pointer; font-size: 10px; line-height: 1;
+}
+.panel button.resume-clear:hover { background: var(--bad); color: #fff; }
+
+/* resume picker: the conversation list inside the modal */
+.resume-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 50vh; overflow-y: auto; }
+.resume-item {
+  padding: 7px 9px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-elevated);
+  cursor: pointer; margin-bottom: 6px;
+}
+.resume-item:hover { background: var(--bg-control); border-color: var(--accent-hover); }
+.resume-item.disabled { opacity: .5; pointer-events: none; }
+.resume-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 3px; }
+.resume-id { font-family: Consolas, monospace; font-size: 12px; color: var(--text-bright); }
+.resume-when { font-size: 10px; color: var(--text-muted); white-space: nowrap; }
+.resume-badge { color: var(--accent-hover); font-weight: 600; }
+.resume-line {
+  font-size: 11px; color: var(--text-muted); line-height: 1.35;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.resume-tagname {
+  display: inline-block; min-width: 24px; margin-right: 5px; font-size: 9px; text-transform: uppercase;
+  letter-spacing: .5px; color: var(--text-dim);
+}
+.resume-tagname.ai { color: var(--accent-hover); }
 
 .chk { display: flex; align-items: center; gap: 6px; flex-direction: row; font-size: 12px; color: var(--text); cursor: pointer; }
 .chk input { width: auto; margin: 0; }
