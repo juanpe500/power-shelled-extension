@@ -9,6 +9,8 @@ let paneStore = {};     // { tabId: {ids:[sessionId,...], orient:'cols'|'rows'} 
 let panes = [];         // live panes for the current tab: [{id, term, fit, ws, el, host, ic, nm, meta}]
 let focusedId = null;   // which pane has focus (drives the top-bar title + conn dot)
 let zoomStore = {};     // { sessionId: fontSizePx } — per-session zoom (persisted as ct_zoom)
+let theme = {};         // global look overrides { border, termBg } (persisted as ct_theme)
+const DEFAULT_THEME = { border: '#0e4c00', termBg: '#000000' };   // filled from :root at boot
 const MAX_PANES = 6;
 const DEFAULT_FONT = 13, MIN_FONT = 6, MAX_FONT = 40;
 let currentTabId = null, currentWinId = null;
@@ -33,9 +35,10 @@ async function api(path, opts = {}) {
 // ---- storage ------------------------------------------------------------
 function loadState() {
   return new Promise((res) => {
-    chrome.storage.local.get(['ct_cfg', 'ct_panes', 'ct_bindings', 'ct_zoom', 'ct_workspaces', 'ct_favorites'], (o) => {
+    chrome.storage.local.get(['ct_cfg', 'ct_panes', 'ct_bindings', 'ct_zoom', 'ct_workspaces', 'ct_favorites', 'ct_theme'], (o) => {
       if (o.ct_cfg) cfg = { ...DEFAULTS, ...o.ct_cfg };
       zoomStore = o.ct_zoom || {};
+      theme = o.ct_theme || {};
       workspaces = o.ct_workspaces || [];
       favorites = o.ct_favorites || [];
       if (o.ct_panes) paneStore = o.ct_panes;
@@ -86,8 +89,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes.ct_panes) { paneStore = changes.ct_panes.newValue || {}; applyView(); renderList(lastList); }
-  if (changes.ct_workspaces) { workspaces = changes.ct_workspaces.newValue || []; populateWsDropdown(); renderWsEditor(); }
-  if (changes.ct_favorites) { favorites = changes.ct_favorites.newValue || []; renderFavList(); updateFavStar(); }
+  if (changes.ct_workspaces) { workspaces = changes.ct_workspaces.newValue || []; renderWsChips(); renderWsEditor(); }
+  if (changes.ct_favorites) { favorites = changes.ct_favorites.newValue || []; renderFavList(); renderDrawerFavs(); updateFavStar(); }
+  if (changes.ct_theme) { theme = changes.ct_theme.newValue || {}; applyTheme(); populateCustomInputs(); }
 });
 
 // ---- panes (multi-terminal grid) ----------------------------------------
@@ -98,14 +102,49 @@ function termColors() {
     foreground: cs.getPropertyValue('--term-fg').trim() || '#e6e6e6',
   };
 }
+// ---- global theme (Customization tab): border color + terminal background ---
+function saveTheme() { chrome.storage.local.set({ ct_theme: theme }); }
+// Snapshot the :root defaults once, before any override is applied, so "Reset"
+// and the color pickers know the baseline.
+function readDefaultTheme() {
+  const cs = getComputedStyle(document.documentElement);
+  const b = cs.getPropertyValue('--border').trim();
+  const t = cs.getPropertyValue('--term-bg').trim();
+  if (b) DEFAULT_THEME.border = b;
+  if (t) DEFAULT_THEME.termBg = t;
+}
+function effTheme() {
+  return { border: theme.border || DEFAULT_THEME.border, termBg: theme.termBg || DEFAULT_THEME.termBg };
+}
+// Push overrides onto :root (or clear them) and re-tint any live terminals.
+function applyTheme() {
+  const s = document.documentElement.style;
+  if (theme.border) s.setProperty('--border', theme.border); else s.removeProperty('--border');
+  if (theme.termBg) s.setProperty('--term-bg', theme.termBg); else s.removeProperty('--term-bg');
+  retintPanes();
+}
+function retintPanes() {
+  const t = termColors();
+  for (const p of panes) {
+    try { if (p.term.options) p.term.options.theme = t; else p.term.setOption('theme', t); } catch (_) {}
+  }
+}
+function populateCustomInputs() {
+  const e = effTheme();
+  $('cust-border').value = e.border; $('cust-border-hex').textContent = e.border;
+  $('cust-termbg').value = e.termBg; $('cust-termbg-hex').textContent = e.termBg;
+}
+
 function makePane(id) {
   const wrap = document.createElement('div'); wrap.className = 'pane'; wrap.dataset.id = id;
   const head = document.createElement('div'); head.className = 'pane-head';
   const ic = document.createElement('span'); ic.className = 'p-ic';
   const nm = document.createElement('span'); nm.className = 'p-name'; nm.textContent = '…';
+  const hide = document.createElement('button'); hide.className = 'p-hide'; hide.textContent = '–';
+  hide.title = 'Hide pane (session keeps running)';
   const close = document.createElement('button'); close.className = 'p-close'; close.textContent = '✕';
-  close.title = 'Close pane (session keeps running)';
-  head.append(ic, nm, close);
+  close.title = 'Delete session (ends the process)';
+  head.append(ic, nm, hide, close);
   const host = document.createElement('div'); host.className = 'pane-host';
   wrap.append(head, host);
   $('panes').appendChild(wrap);
@@ -115,7 +154,7 @@ function makePane(id) {
     fontSize: zoomStore[id] || DEFAULT_FONT, theme: termColors(), scrollback: 5000,
   });
   const fit = new FitAddon.FitAddon(); term.loadAddon(fit); term.open(host);
-  const pane = { id, term, fit, ws: null, el: wrap, host, ic, nm, meta: null };
+  const pane = { id, term, fit, ws: null, el: wrap, host, ic, nm, meta: null, closing: false, retry: null, backoff: 1000 };
   panes.push(pane);
 
   term.onData((d) => { if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'in', d })); });
@@ -130,7 +169,8 @@ function makePane(id) {
   });
   host.addEventListener('wheel', (e) => { if (!e.ctrlKey) return; e.preventDefault(); zoomPane(pane, e.deltaY < 0 ? +1 : -1); }, { passive: false });
   wrap.addEventListener('mousedown', () => setFocused(id));
-  close.addEventListener('click', (e) => { e.stopPropagation(); removePane(id); });
+  hide.addEventListener('click', (e) => { e.stopPropagation(); removePane(id); });
+  close.addEventListener('click', (e) => { e.stopPropagation(); killSession(id, nm.textContent); });
   connectPane(pane);
   return pane;
 }
@@ -143,11 +183,20 @@ function setZoom(pane, size) {
   setStatus(`zoom: ${size}px`);
 }
 function zoomPane(pane, delta) { setZoom(pane, currentFont(pane) + delta); }
+// Auto-reconnect a pane whose socket dropped (e.g. the server restarted) until
+// its same-id session is back. Guarded so an intentional close never retries.
+function scheduleReconnect(pane) {
+  if (pane.closing || !panes.includes(pane)) return;
+  const delay = pane.backoff || 1000;
+  pane.backoff = Math.min(delay * 2, 10000);
+  clearTimeout(pane.retry);
+  pane.retry = setTimeout(() => { if (!pane.closing && panes.includes(pane)) connectPane(pane); }, delay);
+}
 function connectPane(pane) {
   const url = `${wsBase()}/attach?id=${encodeURIComponent(pane.id)}&token=${encodeURIComponent(cfg.token)}`;
   const sock = new WebSocket(url); pane.ws = sock;
-  sock.onopen = () => { fitPane(pane); updateConnDot(); };
-  sock.onclose = () => updateConnDot();
+  sock.onopen = () => { pane.backoff = 1000; fitPane(pane); updateConnDot(); };
+  sock.onclose = () => { updateConnDot(); scheduleReconnect(pane); };
   sock.onerror = () => updateConnDot();
   sock.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
@@ -158,6 +207,8 @@ function connectPane(pane) {
   };
 }
 function destroyPane(pane) {
+  pane.closing = true;                       // stop the reconnect loop for an intentional close
+  try { clearTimeout(pane.retry); } catch (_) {}
   try { pane.ws && pane.ws.close(); } catch (_) {}
   try { pane.term.dispose(); } catch (_) {}
   try { pane.el.remove(); } catch (_) {}
@@ -183,6 +234,7 @@ function updateConnDot() {
   setConnected(!!(f && f.ws && f.ws.readyState === 1));
 }
 function updateHeader() {
+  if ($('title').querySelector('.name-edit')) return;   // mid inline rename — leave it be
   const n = panes.length;
   const f = panes.find((p) => p.id === focusedId) || panes[0];
   $('sicon').textContent = f && f.meta ? (f.meta.icon || '') : '';
@@ -414,6 +466,8 @@ async function refreshList() {
   syncTabTitles();   // names/icons may have changed → refresh the tab-group pills
 }
 function renderList(list) {
+  // Don't wipe an in-progress inline rename (the 3s poll would otherwise clobber it).
+  if (document.querySelector('#sessList .name-edit, #emptyList .name-edit')) return;
   const boundIds = new Set(Object.values(paneStore).flatMap((r) => r.ids || []));
   const openIds = new Set(tabIds());
   const hasSessions = list.length > 0;
@@ -425,11 +479,23 @@ function renderList(list) {
     for (const s of list) ul.appendChild(buildSessItem(s, boundIds, openIds));
   }
 }
+// Render a name so a trailing "-<number>" slug suffix (e.g. chrome-terminal-916)
+// is NEVER truncated: the head ellipsizes ("chrom…") while the suffix ("-916")
+// stays pinned. Falls back to a plain ellipsizing head when there's no suffix.
+function setNameParts(el, name) {
+  el.textContent = '';
+  const m = /^(.*\S)(-\d+)$/.exec(name);
+  const head = document.createElement('span'); head.className = 's-name-head';
+  head.textContent = m ? m[1] : name;
+  el.appendChild(head);
+  if (m) { const suf = document.createElement('span'); suf.className = 's-name-suf'; suf.textContent = m[2]; el.appendChild(suf); }
+}
 function buildSessItem(s, boundIds, openIds) {
   const here = openIds.has(s.id);
   const li = document.createElement('li');
   li.className = (here ? 'active ' : '') + (s.exited ? 'dead' : '');
-  const pinTag = boundIds.has(s.id) ? '<span class="s-meta" title="open in a tab">📌</span>' : '';
+  // 📌 only when docked in ANOTHER tab — for this tab the green highlight already says so.
+  const pinTag = (boundIds.has(s.id) && !here) ? '<span class="s-meta" title="open in another tab">📌</span>' : '';
   li.innerHTML = `
     <span class="s-dot ${s.exited ? 'dead' : ''}"></span>
     <span class="s-ic"></span>
@@ -444,17 +510,19 @@ function buildSessItem(s, boundIds, openIds) {
     e.stopPropagation();
     openEmojiPop(icEl, (emoji) => changeSessionIcon(s, emoji || '🖥️'));
   });
-  li.querySelector('.s-name').textContent = s.name;
+  const nameEl = li.querySelector('.s-name');
+  setNameParts(nameEl, s.name);
+  nameEl.title = 'Double-click to rename';
+  nameEl.addEventListener('dblclick', (e) => { e.stopPropagation(); startRename(nameEl, s, refreshList); });
   li.title = here ? 'Click to remove from this tab' : 'Click to add as a pane in this tab';
   li.addEventListener('click', (e) => {
     if (e.target.classList.contains('s-kill') || e.target.classList.contains('s-ic')) return;
+    if (e.target.tagName === 'INPUT') return;   // don't toggle while renaming inline
     if (here) removePane(s.id); else addPane(s.id);  // toggle in/out of the grid
   });
-  li.querySelector('.s-kill').addEventListener('click', async (e) => {
+  li.querySelector('.s-kill').addEventListener('click', (e) => {
     e.stopPropagation();
-    try { await api(`/sessions/${s.id}`, { method: 'DELETE' }); } catch (_) {}
-    removePane(s.id);   // no-op if it wasn't shown
-    refreshList();
+    killSession(s.id, s.name);
   });
   return li;
 }
@@ -466,6 +534,46 @@ async function changeSessionIcon(s, icon) {
   const p = panes.find((x) => x.id === s.id);
   if (p) { if (p.meta) p.meta.icon = icon; p.ic.textContent = icon; updateHeader(); }
   refreshList();   // re-renders lists with the new icon + re-syncs the tab-group titles
+}
+// Change the display name of a running session (same rename endpoint), then
+// reflect it in the live pane header, the top bar and the tab-group pill.
+async function changeSessionName(s, name) {
+  try { await api(`/sessions/${s.id}/rename`, { method: 'POST', body: JSON.stringify({ name }) }); }
+  catch (e) { setStatus('rename failed: ' + e.message); refreshList(); updateHeader(); return; }
+  const p = panes.find((x) => x.id === s.id);
+  if (p) { if (p.meta) p.meta.name = name; p.nm.textContent = name; updateHeader(); }
+  refreshList();   // re-renders lists with the new name + re-syncs the tab-group titles
+}
+// Swap element `el` into an inline text input to rename session `s`.
+// Enter or blur commits, Escape cancels; `onDone` redraws el's host on cancel.
+function startRename(el, s, onDone) {
+  if (el.querySelector('input')) return;   // already editing this element
+  const input = document.createElement('input');
+  input.className = 'name-edit';
+  input.value = s.name;
+  el.textContent = '';
+  el.appendChild(input);
+  input.focus(); input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return; done = true;
+    const val = input.value.trim();
+    input.remove();              // drop the editor first so the redraw guards let it through
+    if (save && val && val !== s.name) changeSessionName(s, val);
+    else if (onDone) onDone();   // revert to plain text
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();   // keep terminal / global keys from stealing input
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (e) => e.stopPropagation());
+}
+// The session backing the top-bar header = the focused pane's (or first pane's).
+function focusedSession() {
+  const f = panes.find((p) => p.id === focusedId) || panes[0];
+  return f && f.meta ? f.meta : null;
 }
 
 // ---- tab-group title (name + emoji in the "PS" pill) --------------------
@@ -556,6 +664,7 @@ let lastNamedPath = null;
 let favPick = false;     // a favorite is the current selection → keep the subfolder browser hidden
 let workspaces = [];     // [{name, path}] user-configured roots (persisted as ct_workspaces)
 let favorites = [];      // [{path, crumbs:[{name,path}]}] saved folders (persisted as ct_favorites)
+let wsSel = '';          // selected workspace: '' = none (home dir), or a workspace index
 
 function saveWorkspaces() { chrome.storage.local.set({ ct_workspaces: workspaces }); }
 
@@ -567,16 +676,34 @@ function favIndex(path) { const k = favNorm(path); return favorites.findIndex((f
 // no manual navigation needed. Handles nested paths (e.g. VICLIX › dashboard).
 function applyFav(fav) {
   pickCrumbs = fav.crumbs.map((c) => ({ name: c.name, path: c.path }));
-  // Reflect the root in the workspace dropdown when it matches a configured one.
+  // Reflect the root in the workspace chips when it matches a configured one.
   const root = pickCrumbs[0] ? favNorm(pickCrumbs[0].path) : '';
   const wi = workspaces.findIndex((w) => favNorm(w.path) === root);
-  $('f-ws').value = wi >= 0 ? String(wi) : '';
+  wsSel = wi >= 0 ? String(wi) : ''; renderWsChips();
   // A favorite is a direct pick — don't open the subfolder browser (that's only
   // for navigating a workspace); just set the cwd + auto Name/Run-on-start.
   favPick = true;
   updateCwd();
   // Restore the icon saved with this favorite so it doesn't have to be set again.
   $('f-icon').value = fav.icon || '';
+}
+// Favorites strip at the top of the terminals drawer (☰). Clicking one opens the
+// New-terminal (＋) panel with that folder preloaded — exactly as if the favorite
+// had been clicked inside ＋ — so the last details can still be tweaked before Create.
+function renderDrawerFavs() {
+  const ul = $('d-fav-list'); if (!ul) return;
+  ul.innerHTML = '';
+  $('d-fav-empty').classList.toggle('hidden', favorites.length > 0);
+  favorites.forEach((fav) => {
+    const tip = fav.crumbs[fav.crumbs.length - 1];
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="d-ic"></span><span class="fav-name"></span>`;
+    li.querySelector('.d-ic').textContent = fav.icon || '⭐';
+    li.querySelector('.fav-name').textContent = tip ? tip.name : fav.path;
+    li.title = fav.path + ' — open in ＋ with this folder preloaded';
+    li.addEventListener('click', () => openNewFormWithFav(fav));
+    ul.appendChild(li);
+  });
 }
 function renderFavList() {
   const ul = $('f-fav-list'); if (!ul) return;
@@ -604,9 +731,15 @@ function renderFavList() {
         if (favPick && favNorm(fav.path) === favNorm(pickCwd)) $('f-icon').value = fav.icon || '';
       });
     });
-    li.querySelector('.s-kill').addEventListener('click', (e) => {
+    li.querySelector('.s-kill').addEventListener('click', async (e) => {
       e.stopPropagation();
-      favorites.splice(i, 1); saveFavorites(); renderFavList(); updateFavStar();
+      const label = tip ? tip.name : fav.path;
+      const safe = label.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+      const ok = await confirmDialog({ message: `Remove <b>${safe}</b> from favorites?` });
+      if (!ok) return;
+      const j = favIndex(fav.path);              // re-find: index may have shifted
+      if (j >= 0) favorites.splice(j, 1);
+      saveFavorites(); renderFavList(); updateFavStar();
     });
     ul.appendChild(li);
   });
@@ -635,15 +768,30 @@ function updateFavStar() {
   star.classList.toggle('on', on);
   star.title = on ? 'Remove this folder from favorites' : 'Save this folder as a favorite';
 }
-// The workspace dropdown in the New-terminal form, filled from user config (local).
-function populateWsDropdown() {
-  const sel = $('f-ws');
-  sel.innerHTML = '';
-  const none = document.createElement('option'); none.value = ''; none.textContent = '— none (home dir) —';
-  sel.appendChild(none);
-  workspaces.forEach((w, i) => {
-    const o = document.createElement('option'); o.value = String(i); o.textContent = w.name; sel.appendChild(o);
-  });
+// The workspace picker in the New-terminal form: horizontal chips (from user config).
+function renderWsChips() {
+  const box = $('f-ws-chips'); if (!box) return;
+  box.innerHTML = '';
+  const mk = (val, label, title) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ws-chip' + (String(wsSel) === String(val) ? ' active' : '');
+    b.textContent = label; if (title) b.title = title;
+    b.addEventListener('click', () => selectWorkspace(val));
+    box.appendChild(b);
+  };
+  mk('', '⌂ home', 'No workspace — start in the home dir');
+  workspaces.forEach((w, i) => mk(String(i), w.name, w.path));
+}
+// Pick a workspace chip: '' = home (reset), or an index → navigate that root.
+async function selectWorkspace(val) {
+  wsSel = val;
+  renderWsChips();
+  if (val === '') { resetPicker(); return; }
+  const w = workspaces[Number(val)];
+  if (!w) { wsSel = ''; renderWsChips(); resetPicker(); return; }
+  pickCrumbs = [{ name: w.name, path: w.path }]; favPick = false;
+  await refreshBrowser();
 }
 // Workspace manager (in ⚙ settings): add/remove your own roots.
 function renderWsEditor() {
@@ -668,15 +816,21 @@ function makeName(dir) {
   const slug = base.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'session';
   return `${slug}-${Math.floor(Math.random() * 900) + 100}`;
 }
-// The "claude" launch command: opus model + remote-control, optional --continue.
+// The "claude" launch command: opus model + Remote Control named '<slug>-<rand>'
+// (pickName) so the session shows up in the phone's RC list. The server still
+// appends --session-id after this for deterministic resume; on restart resumeCmd
+// strips the session flags but KEEPS --remote-control <name>, so the same RC name
+// survives the resume.
 function buildCmd() {
   if (!pickCwd) return '';
-  return `claude --model claude-opus-4-8 --remote-control --name ${pickName}${contFlag ? ' --continue' : ''}`;
+  return `claude --model claude-opus-4-8 --remote-control ${pickName}${contFlag ? ' --continue' : ''}`;
 }
 
 function updateCwd() {
   pickCwd = pickCrumbs.length ? pickCrumbs[pickCrumbs.length - 1].path : null;
-  $('f-browser').classList.toggle('hidden', !pickCwd || favPick);
+  const browsingWs = !!pickCwd && !favPick;   // a workspace root is picked & being navigated
+  $('f-browser').classList.toggle('hidden', !browsingWs);
+  $('f-favs').classList.toggle('hidden', browsingWs);   // favorites only when not browsing a workspace
   $('f-cwd-label').textContent = pickCwd || '(home)';
   // Regenerate the RC name only when the selected path actually changes (so the
   // --continue toggle keeps the same random suffix).
@@ -730,14 +884,6 @@ function resetPicker() {
   $('f-dirs-empty').classList.add('hidden');
   updateCwd();
 }
-$('f-ws').addEventListener('change', async () => {
-  const sel = $('f-ws');
-  if (sel.value === '') { resetPicker(); return; }
-  const w = workspaces[Number(sel.value)];
-  if (!w) { resetPicker(); return; }
-  pickCrumbs = [{ name: w.name, path: w.path }]; favPick = false;
-  await refreshBrowser();
-});
 $('f-fav-star').addEventListener('click', toggleFav);
 $('f-cmd').addEventListener('input', () => { cmdAuto = false; });
 $('f-name').addEventListener('input', () => { nameAuto = false; });
@@ -788,41 +934,139 @@ document.addEventListener('click', (e) => {
   pop.classList.add('hidden');
 });
 
+// ---- custom confirmation dialog (native confirm() is blocked in the panel) --
+let confirmResolve = null;
+function confirmDialog({ title, message, icon, okText } = {}) {
+  if (title != null) $('confirmTitle').textContent = title;
+  $('confirmIcon').textContent = icon || '🗑️';
+  $('confirmMsg').innerHTML = message || '';
+  $('confirmOk').textContent = okText || 'Remove';
+  $('confirmBackdrop').classList.remove('hidden');
+  $('confirmOk').focus();
+  return new Promise((resolve) => { confirmResolve = resolve; });
+}
+function closeConfirm(result) {
+  if (!confirmResolve) return;
+  const r = confirmResolve; confirmResolve = null;
+  $('confirmBackdrop').classList.add('hidden');
+  r(result);
+}
+$('confirmOk').addEventListener('click', () => closeConfirm(true));
+$('confirmCancel').addEventListener('click', () => closeConfirm(false));
+$('confirmBackdrop').addEventListener('click', (e) => { if (e.target === $('confirmBackdrop')) closeConfirm(false); });
+document.addEventListener('keydown', (e) => {
+  if ($('confirmBackdrop').classList.contains('hidden')) return;
+  if (e.key === 'Escape') { e.preventDefault(); closeConfirm(false); }
+  else if (e.key === 'Enter') { e.preventDefault(); closeConfirm(true); }
+});
+
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+// Kill a session for good (ends its PTY/process), after a custom confirmation.
+// Used by both the pane header delete button and the drawer terminal list.
+async function killSession(id, name) {
+  const ok = await confirmDialog({
+    title: 'Delete terminal?', icon: '🗑️', okText: 'Delete',
+    message: `Delete <b>${escHtml(name || 'this terminal')}</b>?<br>This ends the session and its process.`,
+  });
+  if (!ok) return;
+  try { await api(`/sessions/${id}`, { method: 'DELETE' }); } catch (_) {}
+  removePane(id);     // drop the pane if it was shown (no-op otherwise)
+  refreshList();
+}
+
 // ---- panels -------------------------------------------------------------
-function hidePanels() { for (const p of ['drawer', 'newForm', 'cfgForm']) $(p).classList.add('hidden'); refitAll(); }
+// Each header button reflects whether ITS panel is open (stays highlighted while
+// open; click again to close — see the newBtn/menuBtn/cfgBtn handlers).
+const PANEL_BTN = { drawer: 'menuBtn', newForm: 'newBtn', cfgForm: 'cfgBtn' };
+function syncPanelBtns() {
+  for (const [panel, btn] of Object.entries(PANEL_BTN)) {
+    $(btn).classList.toggle('active', !$(panel).classList.contains('hidden'));
+  }
+}
+function hidePanels() { for (const p of ['drawer', 'newForm', 'cfgForm']) $(p).classList.add('hidden'); syncPanelBtns(); refitAll(); }
 function toggle(id) {
   const el = $(id); const wasHidden = el.classList.contains('hidden');
   hidePanels(); if (wasHidden) el.classList.remove('hidden');
-  refitAll();
+  syncPanelBtns(); refitAll();
 }
 
 // ---- wire up ------------------------------------------------------------
-$('menuBtn').addEventListener('click', () => { toggle('drawer'); refreshList(); });
+$('menuBtn').addEventListener('click', () => { toggle('drawer'); refreshList(); renderDrawerFavs(); });
 $('orientBtn').addEventListener('click', cycleLayout);
+// Header icon + title edit the focused session in place, mirroring the drawer.
+$('sicon').addEventListener('click', () => {
+  const s = focusedSession(); if (!s) return;
+  openEmojiPop($('sicon'), (emoji) => changeSessionIcon(s, emoji || '🖥️'));
+});
+$('title').addEventListener('click', () => {
+  const s = focusedSession(); if (!s) return;
+  startRename($('title'), s, updateHeader);
+});
 $('cfgBtn').addEventListener('click', () => {
   $('c-host').value = cfg.host; $('c-port').value = cfg.port;
   $('c-token').value = cfg.token;
-  renderWsEditor();
+  renderWsEditor(); populateCustomInputs(); cfgSelectTab('tab-server');
   toggle('cfgForm');
+});
+// settings tabs (Server / Workspaces / Customization)
+function cfgSelectTab(id) {
+  for (const b of $('cfgTabs').querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === id);
+  for (const p of ['tab-server', 'tab-ws', 'tab-custom']) $(p).classList.toggle('hidden', p !== id);
+}
+$('cfgTabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab'); if (btn) cfgSelectTab(btn.dataset.tab);
+});
+// customization color pickers — live preview on input, persist on commit
+$('cust-border').addEventListener('input', (e) => {
+  theme.border = e.target.value; $('cust-border-hex').textContent = e.target.value; applyTheme();
+});
+$('cust-border').addEventListener('change', saveTheme);
+$('cust-termbg').addEventListener('input', (e) => {
+  theme.termBg = e.target.value; $('cust-termbg-hex').textContent = e.target.value; applyTheme();
+});
+$('cust-termbg').addEventListener('change', saveTheme);
+$('cust-reset').addEventListener('click', () => {
+  theme = {}; applyTheme(); saveTheme(); populateCustomInputs();
 });
 $('ws-add').addEventListener('click', () => {
   const name = $('ws-name').value.trim();
   const path = $('ws-path').value.trim();
   if (!name || !path) { setStatus('workspace needs a name and a path'); return; }
   workspaces.push({ name, path });
-  saveWorkspaces(); renderWsEditor(); populateWsDropdown();
+  saveWorkspaces(); renderWsEditor(); renderWsChips();
   $('ws-name').value = ''; $('ws-path').value = '';
 });
 function openNewForm() {
-  loadShells(); populateWsDropdown(); renderFavList();
-  $('f-icon').value = ''; $('f-ws').value = '';
+  loadShells(); renderFavList();
+  wsSel = ''; renderWsChips();
+  $('f-icon').value = '';
   $('f-cont').checked = false; $('emojiPop').classList.add('hidden');
   cmdAuto = true; nameAuto = true; contFlag = false;
   resetPicker();                          // clears cwd + Name + Run-on-start
-  hidePanels(); $('newForm').classList.remove('hidden');
+  hidePanels(); $('newForm').classList.remove('hidden'); syncPanelBtns();
 }
-$('newBtn').addEventListener('click', openNewForm);
+// Open ＋ and preload a favorite, same as clicking it inside the ＋ panel's fav list.
+function openNewFormWithFav(fav) {
+  openNewForm();     // resets the picker + populates dropdowns first
+  applyFav(fav);     // then restore workspace/cwd/name/cmd/icon (updateCwd re-highlights the fav)
+}
+// Toggle: click ＋ to open the New-terminal panel, click it again to close it.
+$('newBtn').addEventListener('click', () => {
+  if ($('newForm').classList.contains('hidden')) openNewForm(); else hidePanels();
+});
 $('empty-new').addEventListener('click', openNewForm);
+// Click anywhere outside an open dropdown panel (terminals list / settings) closes it.
+// Runs on bubble, after the header buttons' own click handlers (which live in #bar).
+document.addEventListener('click', (e) => {
+  const openDrop = ['drawer', 'cfgForm'].find((id) => !$(id).classList.contains('hidden'));
+  if (!openDrop) return;
+  if ($('bar').contains(e.target)) return;             // header buttons handle their own toggle
+  if ($(openDrop).contains(e.target)) return;          // clicks inside the panel stay
+  if ($('confirmBackdrop').contains(e.target)) return; // don't close under a confirm dialog
+  hidePanels();
+});
 $('tabBtn').addEventListener('click', () => { chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel.html') }); });
 
 $('f-cancel').addEventListener('click', hidePanels);
@@ -835,7 +1079,8 @@ $('f-create').addEventListener('click', async () => {
   };
   try {
     const s = await api('/sessions', { method: 'POST', body: JSON.stringify(body) });
-    $('f-name').value = ''; $('f-cmd').value = ''; $('f-icon').value = ''; $('f-ws').value = '';
+    $('f-name').value = ''; $('f-cmd').value = ''; $('f-icon').value = '';
+    wsSel = ''; renderWsChips();
     $('f-cont').checked = false;
     cmdAuto = true; nameAuto = true; contFlag = false; resetPicker();
     await refreshList();          // pull the new session into lastList so the tab-group title resolves now, not on next drawer open
@@ -857,6 +1102,8 @@ $('c-save').addEventListener('click', () => {
 // ---- boot ---------------------------------------------------------------
 (async function boot() {
   await loadState();
+  readDefaultTheme();   // snapshot :root baseline before applying any override
+  applyTheme();         // paint saved border/terminal-bg overrides (if any)
   await initTab();
   await refreshList();
   applyView();

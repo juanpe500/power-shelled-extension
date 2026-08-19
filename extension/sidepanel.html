@@ -9,18 +9,23 @@
   <div id="app">
     <header id="bar">
       <button id="menuBtn" class="icon" title="Sessions">☰</button>
+      <button id="newBtn" class="icon" title="New terminal">＋</button>
       <button id="orientBtn" class="icon hidden" title="Split direction">⬌</button>
-      <span id="sicon"></span>
-      <span id="title">Power Shell(ed)</span>
+      <span id="sicon" title="Change icon"></span>
+      <span id="title" title="Click to rename">Power Shell(ed)</span>
       <span id="dot" class="dot" title="disconnected"></span>
       <div class="grow"></div>
-      <button id="newBtn" class="icon" title="New terminal">＋</button>
       <button id="tabBtn" class="icon" title="Open in new tab">⧉</button>
       <button id="cfgBtn" class="icon" title="Server settings">⚙</button>
     </header>
 
     <!-- session drawer -->
     <div id="drawer" class="panel hidden">
+      <div id="drawerFavs" class="drawer-favs">
+        <div class="panel-h">Favorites</div>
+        <ul id="d-fav-list" class="sess-list favlist"></ul>
+        <div class="hint" id="d-fav-empty">No favorites yet — save folders from ＋.</div>
+      </div>
       <div class="panel-h">Terminals</div>
       <ul id="sessList" class="sess-list"></ul>
       <div class="panel-empty" id="sessEmpty">No terminals yet.</div>
@@ -34,9 +39,10 @@
         <label style="flex:1 1 auto">Name <input id="f-name" placeholder="e.g. claude viclix" /></label>
       </div>
       <label>Shell <select id="f-shell"></select></label>
-      <label>Workspace
-        <select id="f-ws"><option value="">— none (home dir) —</option></select>
-      </label>
+      <div class="ws-field">
+        <div class="favs-h">Workspace</div>
+        <div id="f-ws-chips" class="ws-chips"></div>
+      </div>
       <div id="f-favs" class="favs">
         <div class="favs-h">Favorites</div>
         <ul id="f-fav-list" class="sess-list favlist"></ul>
@@ -60,25 +66,47 @@
 
     <!-- settings -->
     <div id="cfgForm" class="panel hidden">
-      <div class="panel-h">Server settings</div>
-      <label>Host <input id="c-host" value="127.0.0.1" /></label>
-      <label>Port <input id="c-port" value="3777" /></label>
-      <label>Token <input id="c-token" placeholder="paste from server console" /></label>
-      <div class="row">
-        <button id="c-save" class="primary">Save &amp; connect</button>
-        <button id="c-cancel">Cancel</button>
+      <div class="tabs" id="cfgTabs">
+        <button type="button" class="tab active" data-tab="tab-server">Server settings</button>
+        <button type="button" class="tab" data-tab="tab-ws">Workspaces</button>
+        <button type="button" class="tab" data-tab="tab-custom">Customization</button>
       </div>
-      <div class="hint">The server prints its port &amp; token when it starts.</div>
 
-      <div class="panel-h" style="margin-top:16px">Workspaces</div>
-      <div class="hint" style="margin-top:0">Named roots the New-terminal folder picker starts from. Saved in the browser.</div>
-      <ul id="wsList" class="sess-list ws-list"></ul>
-      <div class="panel-empty" id="wsEmpty">No workspaces yet — add one below.</div>
-      <div class="row">
-        <input id="ws-name" placeholder="name (e.g. c-fastapi)" style="flex:0 0 40%" />
-        <input id="ws-path" placeholder="C:\path\to\folder" />
+      <!-- Server settings tab -->
+      <div id="tab-server" class="tabpane">
+        <label>Host <input id="c-host" value="127.0.0.1" /></label>
+        <label>Port <input id="c-port" value="3777" /></label>
+        <label>Token <input id="c-token" placeholder="paste from server console" /></label>
+        <div class="row">
+          <button id="c-save" class="primary">Save &amp; connect</button>
+          <button id="c-cancel">Cancel</button>
+        </div>
+        <div class="hint">The server prints its port &amp; token when it starts.</div>
       </div>
-      <div class="row"><button id="ws-add">＋ Add workspace</button></div>
+
+      <!-- Workspaces tab -->
+      <div id="tab-ws" class="tabpane hidden">
+        <div class="hint" style="margin-top:0">Named roots the New-terminal folder picker starts from. Saved in the browser.</div>
+        <ul id="wsList" class="sess-list ws-list"></ul>
+        <div class="panel-empty" id="wsEmpty">No workspaces yet — add one below.</div>
+        <div class="row">
+          <input id="ws-name" placeholder="name (e.g. c-fastapi)" style="flex:0 0 40%" />
+          <input id="ws-path" placeholder="C:\path\to\folder" />
+        </div>
+        <div class="row"><button id="ws-add">＋ Add workspace</button></div>
+      </div>
+
+      <!-- Customization tab (global, applies to every terminal + tab) -->
+      <div id="tab-custom" class="tabpane hidden">
+        <div class="hint" style="margin-top:0">Global look — one setting for all terminals and tabs.</div>
+        <label class="color-row">Border color
+          <span class="color-ctl"><span class="color-hex" id="cust-border-hex"></span><input type="color" id="cust-border" /></span>
+        </label>
+        <label class="color-row">Terminal background
+          <span class="color-ctl"><span class="color-hex" id="cust-termbg-hex"></span><input type="color" id="cust-termbg" /></span>
+        </label>
+        <div class="row"><button id="cust-reset">Reset to defaults</button></div>
+      </div>
     </div>
 
     <div id="termWrap">
@@ -101,6 +129,19 @@
     <!-- floating emoji picker (position:fixed, anchored by JS) — kept OUTSIDE all
          panels so a hidden (display:none) panel can't suppress its rendering -->
     <div id="emojiPop" class="emoji-pop hidden"></div>
+
+    <!-- custom confirmation dialog (replaces native confirm(), which is blocked) -->
+    <div id="confirmBackdrop" class="modal-backdrop hidden">
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="modal-icon" id="confirmIcon">🗑️</div>
+        <div class="modal-title" id="confirmTitle">Remove favorite?</div>
+        <div class="modal-msg" id="confirmMsg"></div>
+        <div class="modal-actions">
+          <button id="confirmCancel">Cancel</button>
+          <button id="confirmOk" class="danger">Remove</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="vendor/xterm.js"></script>

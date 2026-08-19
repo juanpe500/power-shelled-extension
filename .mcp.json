@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "chrome-browser": {
+      "type": "http",
+      "url": "http://127.0.0.1:3777/mcp",
+      "headers": {
+        "x-ct-session": "${CT_SESSION_ID:-}"
+      }
+    }
+  }
+}

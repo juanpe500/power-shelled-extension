@@ -3,12 +3,14 @@ node_modules/
 
 # secrets / local runtime
 .token
+.sessions.json
 *.env
 .env
 !.env.example
 
 # internal dev notes (kept local, not published)
 _STATE.md
+test.md
 
 # OS junk
 .DS_Store

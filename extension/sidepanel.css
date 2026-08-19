@@ -53,7 +53,15 @@ body {
 }
 #bar #title {
   font-weight: 600; white-space: nowrap; overflow: hidden;
-  text-overflow: ellipsis; max-width: 55%;
+  text-overflow: ellipsis; max-width: 55%; cursor: pointer;
+  border-radius: 4px; padding: 1px 3px;
+}
+#bar #title:hover { background: var(--bg-hover); }
+/* inline rename input, shared by the drawer list and the top-bar title */
+.name-edit {
+  font: inherit; color: var(--text); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 0 3px; min-width: 0; width: 100%; box-sizing: border-box;
 }
 .grow { flex: 1 1 auto; }
 .icon {
@@ -61,6 +69,9 @@ body {
   font-size: 16px; cursor: pointer; padding: 2px 6px; border-radius: 5px;
 }
 .icon:hover { background: var(--border); color: var(--text-bright); }
+.icon.active { background: var(--sel); color: var(--text-bright); }
+.icon.active:hover { background: var(--sel); }
+.icon.hidden { display: none; }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: 0 0 auto; }
 .dot.on { background: var(--ok); }
@@ -90,6 +101,26 @@ body {
 .panel button.primary:hover { background: var(--accent-hover); }
 .hint { color: var(--text-muted); font-size: 11px; margin-top: 8px; }
 
+/* settings tabs */
+.tabs { display: flex; gap: 2px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+.tabs .tab {
+  background: transparent; border: none; border-bottom: 2px solid transparent;
+  color: var(--text-dim); cursor: pointer; font: inherit; font-size: 12px;
+  padding: 6px 10px; margin-bottom: -1px; border-radius: 5px 5px 0 0;
+}
+.tabs .tab:hover { color: var(--text-bright); background: var(--bg-hover); }
+.tabs .tab.active { color: var(--text-bright); border-bottom-color: var(--accent-hover); }
+.tabpane.hidden { display: none; }
+
+/* customization color pickers */
+.panel label.color-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.color-ctl { display: inline-flex; align-items: center; gap: 8px; }
+.color-hex { font-size: 11px; color: var(--text-muted); font-family: Consolas, monospace; }
+.panel input[type="color"] {
+  width: 42px; height: 26px; margin: 0; padding: 2px;
+  border: 1px solid var(--border-input); border-radius: 5px; background: var(--bg); cursor: pointer;
+}
+
 .sess-list { list-style: none; margin: 0; padding: 0; }
 .sess-list li {
   display: flex; align-items: center; gap: 8px;
@@ -99,12 +130,31 @@ body {
 .sess-list li.active { background: var(--sel); }
 .sess-list li.dead { opacity: .55; }
 
+/* drawer (☰): favorites strip on top, then a compacter terminals list.
+   The terminals list flows horizontally when the panel is wide enough (≥2 fit per
+   row) and falls back to one-per-row (vertical, as before) when it's narrow. */
+.drawer-favs { margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.drawer-favs .panel-h { margin-bottom: 6px; }
+#drawer > .sess-list { display: flex; flex-wrap: wrap; gap: 4px; }
+#drawer > .sess-list > li {
+  flex: 1 1 170px; min-width: 0;   /* grow to full-width when alone on a row */
+  padding: 3px 8px; gap: 6px;
+}
+/* When a chip is tight, sacrifice the shell·eyes meta first (huge shrink factor +
+   ellipsis) and keep the name — never truncate the name until the meta is gone. */
+#drawer > .sess-list > li .s-name { flex: 1 1 auto; flex-shrink: 1; min-width: 0; }
+#drawer > .sess-list > li .s-meta {
+  flex: 0 1 auto; flex-shrink: 100; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+}
+
 /* session list inside the empty state */
 #emptyList { text-align: left; margin: 4px 0 14px; max-height: 40vh; overflow-y: auto; }
 #emptyList:empty { display: none; }
 
 /* folder picker in the New terminal form */
 .browser { border: 1px solid var(--border); border-radius: 6px; padding: 6px; margin-bottom: 8px; background: var(--bg-elevated); }
+.browser.hidden { display: none; }
 .crumbs { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; margin-bottom: 4px; font-size: 12px; }
 .crumbs button {
   background: transparent; border: none; color: var(--link); cursor: pointer;
@@ -113,30 +163,61 @@ body {
 }
 .crumbs button:hover { background: var(--bg-control); }
 .crumbs .sep { color: var(--text-muted); }
-.dirlist { max-height: 30vh; overflow-y: auto; }
-.dirlist li { padding: 5px 6px; }
-.dirlist li .d-ic { flex: 0 0 auto; }
-.dirlist li .d-name { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dirlist { max-height: 34vh; overflow-y: auto; }
+.dirlist li { padding: 2px 4px; gap: 6px; }
+.dirlist li .d-ic { flex: 0 0 auto; font-size: 13px; }
+.dirlist li .d-name { flex: 1 1 auto; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dirlist li .d-into { color: var(--text-muted); font-size: 12px; }
-.cwd-pick { margin-top: 6px; font-size: 11px; color: var(--text-dim); word-break: break-all; display: flex; align-items: flex-start; gap: 6px; }
+.cwd-pick { margin-top: 6px; font-size: 11px; color: var(--text-dim); word-break: break-all; display: flex; align-items: center; gap: 6px; }
 .cwd-pick #f-cwd-label { color: var(--text); flex: 1 1 auto; }
-.fav-star { flex: 0 0 auto; background: transparent; border: none; color: var(--text-muted);
-  cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px; }
-.fav-star:hover { color: var(--text-bright); }
-.fav-star.on { color: #f5c518; }
+/* star toggles (dir rows + cwd pick) — override the boxy .panel button styling */
+.panel button.fav-star {
+  flex: 0 0 auto; width: 22px; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: none; border-radius: 5px;
+  color: var(--text-muted); cursor: pointer; font-size: 14px; line-height: 1;
+}
+.panel button.fav-star:hover { background: var(--bg-hover); color: var(--text-bright); }
+.panel button.fav-star.on { color: #f5c518; }
 
-/* favorites list (New terminal form, below Workspace) */
+/* workspace picker — horizontal chips (New terminal form) */
+.ws-field { margin: 6px 0; }
+.ws-field .favs-h { margin: 0 0 5px; }
+.ws-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.panel button.ws-chip {
+  padding: 3px 10px; border-radius: 14px; font-size: 12px; line-height: 1.4;
+  border: 1px solid var(--border); background: var(--bg-elevated); color: var(--text);
+  cursor: pointer; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.panel button.ws-chip:hover { background: var(--bg-control); border-color: var(--accent-hover); }
+.panel button.ws-chip.active { background: var(--sel); border-color: var(--accent-hover); color: var(--text-bright); }
+
+/* favorites — horizontal chips (New terminal form, below Workspace) */
 .favs { margin-bottom: 8px; }
+.favs.hidden { display: none; }
 .favs-h { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-dim); margin: 4px 0; }
-.favlist { max-height: 22vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-elevated); }
+.favlist { display: flex; flex-wrap: wrap; gap: 6px; max-height: 24vh; overflow-y: auto; }
 .favlist:empty { display: none; }
-.favlist li { padding: 6px 8px; }
-.favlist .d-ic { flex: 0 0 auto; font-size: 12px; }
-.favlist .fav-name { flex: 0 0 auto; color: var(--text-bright); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; }
-.favlist .fav-trail { flex: 1 1 auto; color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.fav-ic-btn { flex: 0 0 auto; background: transparent; border: none; color: var(--text-muted);
-  cursor: pointer; font-size: 13px; line-height: 1; padding: 0 3px; opacity: .75; }
-.fav-ic-btn:hover { opacity: 1; }
+.favlist li {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 3px 2px 8px; border-radius: 14px;
+  border: 1px solid var(--border); background: var(--bg-elevated); cursor: pointer;
+}
+/* drawer favorites are name-only chips (no edit/delete buttons) → give the name breathing room on the right */
+#d-fav-list li { padding-right: 10px; }
+.favlist li:hover { background: var(--bg-control); border-color: var(--accent-hover); }
+.favlist li.active { background: var(--sel); border-color: var(--accent-hover); }
+.favlist .d-ic { flex: 0 0 auto; font-size: 13px; }
+.favlist .fav-name { flex: 0 1 auto; color: var(--text-bright); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+.favlist .fav-trail { display: none; }
+.panel .favlist button.fav-ic-btn, .panel .favlist button.s-kill {
+  flex: 0 0 auto; width: 18px; height: 18px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: none; border-radius: 50%;
+  color: var(--text-muted); cursor: pointer; font-size: 10px; line-height: 1;
+}
+.panel .favlist button.fav-ic-btn:hover { background: var(--bg-hover); color: var(--text-bright); }
+.panel .favlist button.s-kill:hover { background: var(--bad); color: #fff; }
 #f-fav-empty:not(.hidden) { margin-top: 2px; }
 
 /* emoji picker for the icon field */
@@ -156,6 +237,35 @@ body {
 }
 .emoji-pop .emoji:hover { background: var(--sel); }
 
+/* custom confirmation modal */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .6); padding: 16px;
+  animation: modal-fade .12s ease-out;
+}
+.modal-backdrop.hidden { display: none; }
+.modal {
+  width: 100%; max-width: 300px; text-align: center;
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 16px 14px; box-shadow: 0 12px 40px rgba(0, 0, 0, .6);
+  animation: modal-pop .14s ease-out;
+}
+.modal-icon { font-size: 26px; line-height: 1; margin-bottom: 8px; }
+.modal-title { font-weight: 600; font-size: 14px; color: var(--text-bright); margin-bottom: 4px; }
+.modal-msg { font-size: 12px; color: var(--text-muted); word-break: break-word; margin-bottom: 14px; }
+.modal-msg b { color: var(--text); }
+.modal-actions { display: flex; gap: 8px; }
+.modal-actions button {
+  flex: 1 1 0; padding: 7px 12px; border-radius: 6px; font: inherit; cursor: pointer;
+  border: 1px solid var(--border-input); background: var(--bg-control); color: var(--text);
+}
+.modal-actions button:hover { background: var(--bg-hover); }
+.modal-actions button.danger { border-color: var(--bad); background: var(--bad); color: #fff; }
+.modal-actions button.danger:hover { background: var(--kill-hover); border-color: var(--kill-hover); }
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-pop { from { opacity: 0; transform: translateY(6px) scale(.97); } to { opacity: 1; transform: none; } }
+
 .chk { display: flex; align-items: center; gap: 6px; flex-direction: row; font-size: 12px; color: var(--text); cursor: pointer; }
 .chk input { width: auto; margin: 0; }
 .chk code { background: var(--bg-panel); padding: 0 4px; border-radius: 3px; color: var(--text); }
@@ -163,7 +273,9 @@ body {
 .s-dot.dead { background: var(--bad); }
 .s-ic { flex: 0 0 auto; cursor: pointer; border-radius: 4px; padding: 1px 3px; line-height: 1; }
 .s-ic:hover { background: var(--bg-hover); }
-.s-name { flex: 1 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.s-name { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; white-space: nowrap; }
+.s-name-head { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.s-name-suf { flex: 0 0 auto; }   /* the -NNN slug suffix — always fully visible */
 .s-meta { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
 .s-kill { background: transparent; border: none; color: var(--kill); cursor: pointer; font-size: 14px; padding: 0 4px; }
 .s-kill:hover { color: var(--kill-hover); }
@@ -176,7 +288,8 @@ body {
 .ws-list .s-name { flex: 0 0 auto; color: var(--link); }
 .ws-list .ws-path { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
 
-#sicon { flex: 0 0 auto; font-size: 15px; }
+#sicon { flex: 0 0 auto; font-size: 15px; cursor: pointer; border-radius: 4px; padding: 1px 3px; line-height: 1; }
+#sicon:hover { background: var(--bg-hover); }
 #sicon:empty { display: none; }
 
 #termWrap { flex: 1 1 auto; min-height: 0; position: relative; }
@@ -204,8 +317,15 @@ body {
 #panes.solo .pane-head { display: none; }
 .pane-head .p-ic { flex: 0 0 auto; }
 .pane-head .p-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pane-head .p-close { background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 12px; padding: 0 3px; line-height: 1; }
-.pane-head .p-close:hover { color: var(--kill-hover); }
+.pane-head .p-hide, .pane-head .p-close {
+  flex: 0 0 auto; background: transparent; border: none; color: var(--text-muted);
+  cursor: pointer; font-size: 12px; padding: 0; line-height: 1;
+  width: 18px; height: 18px; border-radius: 4px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.pane-head .p-hide { font-size: 15px; }
+.pane-head .p-hide:hover { background: var(--bg-hover); color: var(--text-bright); }
+.pane-head .p-close:hover { background: var(--bad); color: #fff; }
 .pane-host { flex: 1 1 auto; position: relative; min-height: 0; }
 .pane-host .xterm { position: absolute; inset: 0; padding: 2px; }
 

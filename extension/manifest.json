@@ -3,8 +3,8 @@
   "name": "Power Shell(ed)",
   "version": "0.1.0",
   "description": "Spin up and fully control persistent PowerShell terminals from Chrome's side panel, docked next to any page.",
-  "permissions": ["sidePanel", "storage", "tabs", "tabGroups"],
-  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "permissions": ["sidePanel", "storage", "tabs", "tabGroups", "scripting", "debugger", "alarms"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*", "<all_urls>"],
   "background": { "service_worker": "background.js" },
   "icons": {
     "16": "icon-16.png",
