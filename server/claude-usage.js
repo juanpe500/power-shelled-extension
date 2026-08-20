@@ -226,4 +226,4 @@ function createUsageTracker() {
   return { sample, start, stop, getSummary, getAggregate };
 }
 
-module.exports = { createUsageTracker, resolvePrice, PRICING };
+module.exports = { createUsageTracker, resolvePrice, PRICING, addUsageLine, emptyTotals };

@@ -164,6 +164,15 @@ function makePane(id) {
       if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomPane(pane, +1); return false; }
       if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomPane(pane, -1); return false; }
       if (e.key === '0') { e.preventDefault(); setZoom(pane, DEFAULT_FONT); return false; }
+      // Ctrl+V (and Ctrl+Shift+V): Claude Code's TUI only pastes on Alt+V (ESC v), not on the
+      // Ctrl+V control char (\x16). Send both — \x1bv makes Claude Code paste; \x16 preserves the
+      // native Ctrl+V (e.g. PSReadLine's paste in plain PowerShell). Whichever the app doesn't bind
+      // is a no-op, so this works in both contexts without double-pasting.
+      if (e.key === 'v' || e.key === 'V') {
+        e.preventDefault();
+        if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'in', d: '\x1bv\x16' }));
+        return false;
+      }
     }
     return true;
   });
@@ -494,14 +503,14 @@ function buildSessItem(s, boundIds, openIds) {
   const here = openIds.has(s.id);
   const li = document.createElement('li');
   li.className = (here ? 'active ' : '') + (s.exited ? 'dead' : '');
-  // 📌 only when docked in ANOTHER tab — for this tab the green highlight already says so.
-  const pinTag = (boundIds.has(s.id) && !here) ? '<span class="s-meta" title="open in another tab">📌</span>' : '';
+  // Icon background encodes state: red=exited, green=docked in THIS tab,
+  // amber=alive but not docked anywhere here (replaces the old 📌 tag).
+  const elsewhere = boundIds.has(s.id) && !here;
+  const icState = s.exited ? 'dead' : (elsewhere ? 'elsewhere' : 'alive');
   li.innerHTML = `
-    <span class="s-dot ${s.exited ? 'dead' : ''}"></span>
-    <span class="s-ic"></span>
+    <span class="s-ic ${icState}"></span>
     <span class="s-name"></span>
-    ${pinTag}
-    <span class="s-meta">${s.shellId}${s.clients ? ' · ' + s.clients + '👁' : ''}</span>
+    <span class="s-meta">${s.clients ? s.clients + '👁' : ''}</span>
     <button class="s-kill" title="Kill">✕</button>`;
   const icEl = li.querySelector('.s-ic');
   icEl.textContent = s.icon || '';

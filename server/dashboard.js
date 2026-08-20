@@ -6,6 +6,7 @@
 'use strict';
 
 const { createUsageTracker } = require('./claude-usage');
+const { createHistoryAggregator, localDayKey } = require('./claude-history');
 
 // Amber is the theme (borders/titles) — content uses a real palette on top of
 // it, not amber-on-everything.
@@ -29,6 +30,35 @@ const CLEAR_EOS = '\x1b[J';   // erase from cursor to end of screen
 
 const SPARK_CHARS = '▁▂▃▄▅▆▇█';
 const HISTORY_LEN = 120;
+// Ctrl+R exits with this code; the launcher script loops on it to relaunch.
+const RESTART_EXIT_CODE = 42;
+
+// Distinct fg colors for the per-day line chart's model series (+ legend dots).
+const SERIES_COLORS = [
+  '\x1b[38;2;130;150;255m', // periwinkle
+  '\x1b[38;2;90;210;120m',  // green
+  '\x1b[38;2;255;176;0m',   // amber
+  '\x1b[38;2;100;210;220m', // cyan
+  '\x1b[38;2;220;120;220m', // magenta
+];
+// Heatmap intensity ramp (index 1..4 = low..high). Empty/zero days use grey dots.
+const HEAT_COLORS = [
+  null,
+  '\x1b[38;2;80;54;0m',
+  '\x1b[38;2;140;95;0m',
+  '\x1b[38;2;200;138;0m',
+  '\x1b[38;2;255;176;0m',
+];
+const HEAT_EMPTY = '\x1b[38;2;70;70;70m';
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// Braille dot bit masks, indexed [dy][dx] (dx 0..1, dy 0..3). A cell is
+// U+2800 + OR of the masks of its lit dots — 2×4 sub-pixels per character.
+const DOT = [
+  [0x01, 0x08],
+  [0x02, 0x10],
+  [0x04, 0x20],
+  [0x40, 0x80],
+];
 
 function fmtUsd(n) { return '$' + (n || 0).toFixed(4); }
 function fmtElapsed(ms) {
@@ -97,18 +127,209 @@ function sparkline(values, width) {
   return AMBER + out + RESET + AMBER_DIM + '·'.repeat(Math.max(0, width - slice.length)) + RESET;
 }
 
+function fmtCompact(n) {
+  n = n || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + 'k';
+  return String(Math.round(n));
+}
+function shortModel(m) { return String(m || '').replace(/^claude-/, ''); }
+
+// ── Per-day line chart (braille) ──────────────────────────────────────────
+// dailySeries: [{date, perModel:Map}], models: modelIds to plot (one line each).
+// Returns chart rows (with left y-axis labels) plus an x-axis date row.
+function lineChartLines(dailySeries, models, cellW, cellH) {
+  const n = dailySeries.length;
+  const pxW = cellW * 2, pxH = cellH * 4;
+  const seriesVals = models.map((m) => dailySeries.map((d) => {
+    const t = d.perModel.get(m);
+    return t ? (t.inputTokens + t.outputTokens) : 0;
+  }));
+  let max = 0;
+  for (const sv of seriesVals) for (const v of sv) if (v > max) max = v;
+  if (max <= 0) max = 1;
+
+  const bits = Array.from({ length: cellH }, () => new Uint8Array(cellW));
+  const colr = Array.from({ length: cellH }, () => new Int16Array(cellW).fill(-1));
+  const setPx = (px, py, ci) => {
+    if (px < 0 || px >= pxW || py < 0 || py >= pxH) return;
+    const cx = px >> 1, cy = py >> 2;
+    bits[cy][cx] |= DOT[py & 3][px & 1];
+    colr[cy][cx] = ci; // last series to touch a cell owns its color
+  };
+  const drawLine = (x0, y0, x1, y1, ci) => { // integer Bresenham
+    let dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+    let sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx - dy;
+    for (;;) {
+      setPx(x0, y0, ci);
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * err;
+      if (e2 > -dy) { err -= dy; x0 += sx; }
+      if (e2 < dx) { err += dx; y0 += sy; }
+    }
+  };
+  const xAt = (i) => (n <= 1 ? 0 : Math.round(i / (n - 1) * (pxW - 1)));
+  const yAt = (v) => Math.round((1 - v / max) * (pxH - 1));
+  seriesVals.forEach((sv, si) => {
+    if (n === 1) { if (sv[0] > 0) setPx(xAt(0), yAt(sv[0]), si); return; }
+    for (let i = 0; i < n - 1; i++) {
+      // Skip flat baseline segments — a mostly-idle model would otherwise paint a
+      // solid noisy line along y=0 across the whole width.
+      if (sv[i] === 0 && sv[i + 1] === 0) continue;
+      drawLine(xAt(i), yAt(sv[i]), xAt(i + 1), yAt(sv[i + 1]), si);
+    }
+  });
+
+  const yLabelW = 5;
+  const rows = [];
+  const denom = cellH > 1 ? cellH - 1 : 1; // so the bottom row labels exactly 0
+  for (let cy = 0; cy < cellH; cy++) {
+    let s = AMBER_DIM + padLeft(fmtCompact(max * (denom - cy) / denom), yLabelW) + RESET + ' ';
+    for (let cx = 0; cx < cellW; cx++) {
+      const b = bits[cy][cx];
+      if (!b) { s += ' '; continue; }
+      s += (SERIES_COLORS[colr[cy][cx] % SERIES_COLORS.length] || WHITE) + String.fromCharCode(0x2800 + b) + RESET;
+    }
+    rows.push(s);
+  }
+  // x-axis date labels at ~4 ticks
+  const cells = new Array(cellW).fill(' ');
+  const ticks = n <= 1 ? [0] : [0, Math.floor((n - 1) / 3), Math.floor(2 * (n - 1) / 3), n - 1];
+  const seen = new Set();
+  for (const i of ticks) {
+    if (seen.has(i)) continue;
+    seen.add(i);
+    const d = dailySeries[i].date;
+    const label = MONTHS[d.getMonth()] + ' ' + d.getDate();
+    let col = n <= 1 ? 0 : Math.round(i / (n - 1) * (cellW - 1));
+    col = Math.max(0, Math.min(col, cellW - label.length));
+    for (let k = 0; k < label.length && col + k < cellW; k++) cells[col + k] = label[k];
+  }
+  rows.push(' '.repeat(yLabelW + 1) + AMBER_DIM + cells.join('') + RESET);
+  return rows;
+}
+function legendLine(models) {
+  return models.map((m, si) =>
+    SERIES_COLORS[si % SERIES_COLORS.length] + '●' + RESET + ' ' + WHITE + shortModel(m) + RESET
+  ).join('   ');
+}
+
+// ── Activity heatmap (weekday rows × week columns) ─────────────────────────
+function heatmapLines(dailySeries) {
+  const map = new Map();
+  let max = 0;
+  for (const d of dailySeries) {
+    const v = d.totals.inputTokens + d.totals.outputTokens;
+    map.set(localDayKey(d.date), v);
+    if (v > max) max = v;
+  }
+  const first = dailySeries[0].date;
+  const last = dailySeries[dailySeries.length - 1].date;
+  const gs = new Date(first.getFullYear(), first.getMonth(), first.getDate());
+  gs.setDate(gs.getDate() - ((gs.getDay() + 6) % 7)); // back to Monday
+  const lastMid = new Date(last.getFullYear(), last.getMonth(), last.getDate()).getTime();
+
+  const weeks = [];
+  const cur = new Date(gs);
+  while (cur.getTime() <= lastMid) {
+    const col = [];
+    for (let r = 0; r < 7; r++) {
+      const key = localDayKey(cur);
+      col.push({ date: new Date(cur), v: map.has(key) ? map.get(key) : -1, inWin: map.has(key) });
+      cur.setDate(cur.getDate() + 1);
+    }
+    weeks.push(col);
+  }
+  const level = (v) => {
+    if (v <= 0) return 0;
+    const r = v / (max || 1);
+    return r > 0.75 ? 4 : r > 0.5 ? 3 : r > 0.25 ? 2 : 1;
+  };
+  const cellStr = (c) => {
+    const L = c.inWin ? level(c.v) : 0;
+    return L === 0 ? HEAT_EMPTY + '··' + RESET : HEAT_COLORS[L] + '██' + RESET;
+  };
+
+  const gridW = weeks.length * 2;
+  const hdr = new Array(gridW).fill(' ');
+  let prevM = -1;
+  weeks.forEach((col, ci) => {
+    const mth = col[0].date.getMonth();
+    if (mth !== prevM) {
+      prevM = mth;
+      const lab = MONTHS[mth];
+      for (let k = 0; k < lab.length && ci * 2 + k < gridW; k++) hdr[ci * 2 + k] = lab[k];
+    }
+  });
+  const rowLabels = ['Mon', '', 'Wed', '', 'Fri', '', ''];
+  const lines = ['   ' + AMBER_DIM + hdr.join('') + RESET];
+  for (let r = 0; r < 7; r++) {
+    let s = AMBER_DIM + padRight(rowLabels[r], 3) + RESET;
+    for (const col of weeks) s += cellStr(col[r]);
+    lines.push(s);
+  }
+  lines.push('');
+  lines.push(AMBER_DIM + 'Less ' + RESET +
+    HEAT_COLORS[1] + '█' + HEAT_COLORS[2] + '█' + HEAT_COLORS[3] + '█' + HEAT_COLORS[4] + '█' + RESET +
+    AMBER_DIM + ' More' + RESET);
+  return { lines, width: 3 + gridW };
+}
+
+// ── Budget bars ────────────────────────────────────────────────────────────
+function budgetBar(value, target, barW) {
+  const pct = target > 0 ? value / target : 0;
+  const filled = Math.max(0, Math.min(barW, Math.round(pct * barW)));
+  const color = pct >= 0.9 ? RED : pct >= 0.7 ? AMBER : GREEN;
+  return color + '█'.repeat(filled) + RESET + AMBER_DIM + '░'.repeat(barW - filled) + RESET;
+}
+function budgetLines(runCost, budgetUsd, windowTokens, budgetTokens, barW) {
+  const pctStr = (v, t) => (t > 0 ? Math.round(v / t * 100) + '% used' : 'no target');
+  return [
+    stat('run cost   ', 11, fmtUsd(runCost)) + AMBER_DIM + ' / ' + fmtUsd(budgetUsd) + RESET,
+    budgetBar(runCost, budgetUsd, barW) + ' ' + WHITE + pctStr(runCost, budgetUsd) + RESET,
+    '',
+    stat('30d tokens ', 11, fmtCompact(windowTokens)) + AMBER_DIM + ' / ' + fmtCompact(budgetTokens) + RESET,
+    budgetBar(windowTokens, budgetTokens, barW) + ' ' + WHITE + pctStr(windowTokens, budgetTokens) + RESET,
+  ];
+}
+
 function startDashboard({ getSessions, host, port, token, version, shells, restoredCount }) {
   const tracker = createUsageTracker();
+  const history = createHistoryAggregator({ windowDays: 30, intervalMs: 20000 });
   const startedAt = Date.now();
   const costHistory = [];
   let lastAggCost = 0;
 
+  // Budget-bar targets (env-configurable). Defaults are round numbers, not limits.
+  const budgetUsd = parseFloat(process.env.CT_BUDGET_USD) || 20;
+  const budgetTokens = parseFloat(process.env.CT_BUDGET_TOKENS) || 100e6;
+
   process.stdout.write(ALT_SCREEN_ON + HIDE_CURSOR + CLEAR);
+
+  // Key handling. We put stdin in raw mode so Ctrl+R (restart) is catchable —
+  // but raw mode ALSO suppresses the terminal's automatic SIGINT on Ctrl+C, so
+  // we must detect 0x03 ourselves and run the exact same stop path. Exiting with
+  // RESTART_EXIT_CODE tells the launcher script (start-server.cmd/.ps1) to relaunch;
+  // the fresh server restores the persisted sessions on boot.
+  const stdin = process.stdin;
+  const rawCapable = stdin && stdin.isTTY && typeof stdin.setRawMode === 'function';
+  function onKey(data) {
+    for (const byte of data) {
+      if (byte === 0x03) { cleanupAndExit(); process.exit(0); }                  // Ctrl+C — stop
+      if (byte === 0x12) { cleanupAndExit(); process.exit(RESTART_EXIT_CODE); }  // Ctrl+R — restart
+    }
+  }
+  if (rawCapable) {
+    try { stdin.setRawMode(true); stdin.resume(); stdin.on('data', onKey); } catch (_) {}
+  }
 
   let closing = false;
   function cleanupAndExit() {
     if (closing) return;
     closing = true;
+    // Leave the terminal usable: drop raw mode before restoring the main screen,
+    // or the parent shell inherits a raw stdin (no echo, no line editing).
+    if (rawCapable) { try { stdin.setRawMode(false); stdin.pause(); } catch (_) {} }
     try { process.stdout.write(SHOW_CURSOR + ALT_SCREEN_OFF); } catch (_) {}
   }
   process.on('SIGINT', () => { cleanupAndExit(); process.exit(0); });
@@ -189,12 +410,36 @@ function startDashboard({ getSessions, host, port, token, version, shells, resto
     if (!list.length) rows.push(GREY + '(no sessions)' + RESET);
     const sessionsBox = box('Sessions', fullWidth, rows);
 
-    const footer = GREY + 'Ctrl+C to stop (stops running sessions; restored on restart) · refreshing every 1s' + RESET;
+    // History graphs (per-day, 30-day window) — read from the background
+    // aggregator's in-memory buckets; render is instant.
+    const series = history.getSeries();
+    const models = history.getTopModels(4);
+    const winTot = history.getWindowTotals();
+
+    const chartCellW = Math.max(20, fullWidth - 8); // interior(fullWidth-2) minus y-label(5)+space(1)
+    const chartRows = models.length
+      ? [...lineChartLines(series, models, chartCellW, 6), '', legendLine(models)]
+      : [GREY + '(no history yet — scanning transcripts…)' + RESET];
+    const lineChartBox = box('Tokens / day (30d)', fullWidth, chartRows);
+
+    const heat = heatmapLines(series);
+    const heatBoxWidth = Math.max(heat.width, 20);
+    const budgetBoxWidth = Math.max(24, fullWidth - heatBoxWidth - 1);
+    const heatBox = box('Activity (30d)', heatBoxWidth, heat.lines);
+    const barW = Math.max(10, budgetBoxWidth - 24);
+    const budgetBox = box('Budget', budgetBoxWidth,
+      budgetLines(agg.costUsd, budgetUsd, winTot.inputTokens + winTot.outputTokens, budgetTokens, barW));
+    const histRow = sideBySide([heatBox, budgetBox]);
+
+    const footer = GREY + 'Ctrl+C to stop · Ctrl+R to restart (sessions restored) · refreshing every 1s' + RESET;
 
     // Clear-to-end-of-line after every line + clear-to-end-of-screen after the
     // last one, so a narrower window or a shrinking session list never leaves
     // ghost characters from the previous (larger) frame on screen.
-    const lines = [...serverBox, '', ...statsRow, '', ...sparkBox, '', ...sessionsBox, '', footer];
+    const lines = [
+      ...serverBox, '', ...statsRow, '', ...sparkBox, '', ...sessionsBox, '',
+      ...lineChartBox, '', ...histRow, '', footer,
+    ];
     const frame = HOME + lines.join(CLEAR_EOL + '\r\n') + CLEAR_EOL + CLEAR_EOS;
     try { process.stdout.write(frame); } catch (_) {}
   }
@@ -202,6 +447,9 @@ function startDashboard({ getSessions, host, port, token, version, shells, resto
   // Cost/token tracking runs on its own async loop, off the render path — the
   // render only reads the in-memory totals it accumulates.
   tracker.start(getSessions, 1000);
+  // Historical per-day aggregation runs on its own slow loop (every 20s); the
+  // render reads its in-memory day buckets, never the disk.
+  history.start();
 
   const safeRender = () => { try { renderFrame(); } catch (_) {} };
   safeRender();

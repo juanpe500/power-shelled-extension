@@ -31,6 +31,7 @@
     --term-bg: #000000;
     --term-fg: #e6e6e6;
     --ok: #22cc88;
+    --amber: #e0a020;
     --bad: #bb2233;
     --kill: #aa5555;
     --kill-hover: #ee6666;
@@ -306,15 +307,16 @@ body {
 .chk { display: flex; align-items: center; gap: 6px; flex-direction: row; font-size: 12px; color: var(--text); cursor: pointer; }
 .chk input { width: auto; margin: 0; }
 .chk code { background: var(--bg-panel); padding: 0 4px; border-radius: 3px; color: var(--text); }
-.s-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: 0 0 auto; }
-.s-dot.dead { background: var(--bad); }
-.s-ic { flex: 0 0 auto; cursor: pointer; border-radius: 4px; padding: 1px 3px; line-height: 1; }
-.s-ic:hover { background: var(--bg-hover); }
+.s-ic { flex: 0 0 auto; cursor: pointer; border-radius: 4px; padding: 3px 3px; line-height: 1; background: color-mix(in srgb, var(--ok) 80%, black); }
+.s-ic.elsewhere { background: color-mix(in srgb, var(--amber) 80%, black); }
+.s-ic.dead { background: color-mix(in srgb, var(--bad) 70%, black); }
+.s-ic:hover { filter: brightness(1.15); }
 .s-name { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; white-space: nowrap; }
 .s-name-head { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .s-name-suf { flex: 0 0 auto; }   /* the -NNN slug suffix — always fully visible */
 .s-meta { color: var(--text-muted); font-size: 11px; white-space: nowrap; }
-.s-kill { background: transparent; border: none; color: var(--kill); cursor: pointer; font-size: 14px; padding: 0 4px; }
+.s-kill { background: transparent; border: none; color: var(--kill); cursor: pointer; font-size: 14px; padding: 0 4px; opacity: 0; transition: opacity .12s; }
+.sess-list li:hover .s-kill { opacity: 1; }
 .s-kill:hover { color: var(--kill-hover); }
 .panel-empty { color: var(--text-muted); font-size: 12px; padding: 4px; }
 .panel-empty.hidden { display: none; }
