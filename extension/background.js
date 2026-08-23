@@ -103,6 +103,55 @@ async function reconcileGroups() {
 chrome.runtime.onStartup.addListener(reconcileGroups);
 reconcileGroups();
 
+// ---- auto-attach when a tab is dragged INTO one of our groups ------------
+// The normal direction is panes -> group (attach a session, the tab gets grouped).
+// This is the reverse: when the user drops a fresh tab into an existing orange
+// terminal group, mirror that group's session(s) onto the new tab so it opens
+// PRE-ATTACHED in the side panel — no manual "pick the conversation" step. The
+// session set is copied from an existing member of the same group (the terminal
+// the group represents).
+async function maybeAdoptGroupSessions(tabId, groupId) {
+  try {
+    let g;
+    try { g = await chrome.tabGroups.get(groupId); } catch (_) { return; }
+    if (!g || g.color !== GROUP_COLOR) return;                 // not one of ours
+
+    const { ct_panes: store, ct_tabtitle: titles } =
+      await chrome.storage.local.get(['ct_panes', 'ct_tabtitle']);
+    const cur = (store || {})[tabId];
+    if (cur && Array.isArray(cur.ids) && cur.ids.length) return;  // already has its own terminal
+
+    // find an existing member of this group that already holds a terminal
+    let members;
+    try { members = await chrome.tabs.query({ groupId }); } catch (_) { return; }
+    let srcTab = null, srcRec = null;
+    for (const t of members) {
+      if (t.id === tabId) continue;
+      const rec = (store || {})[t.id];
+      if (rec && Array.isArray(rec.ids) && rec.ids.length) { srcTab = t.id; srcRec = rec; break; }
+    }
+    if (!srcRec) return;
+
+    const nextPanes = { ...(store || {}) };
+    nextPanes[tabId] = { ids: srcRec.ids.slice(0, 6), orient: srcRec.orient || null };
+    const nextTitles = { ...(titles || {}) };
+    if (nextTitles[srcTab]) nextTitles[tabId] = nextTitles[srcTab];  // avoid a "PS" title flicker
+    await chrome.storage.local.set({ ct_panes: nextPanes, ct_tabtitle: nextTitles });
+
+    // prime the per-tab panel so it renders the session the moment it's shown here
+    try { await chrome.sidePanel.setOptions({ tabId, path: PANEL_PATH, enabled: true }); } catch (_) {}
+  } catch (_) {}
+}
+
+// tabs.onUpdated carries changeInfo.groupId when a tab joins/leaves a group.
+// A tab that already has panes (our own group() call) short-circuits above, so
+// this never loops with ensureGrouped.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.groupId != null && changeInfo.groupId !== -1) {
+    maybeAdoptGroupSessions(tabId, changeInfo.groupId);
+  }
+});
+
 // ==== browser control channel ============================================
 // A persistent WS to the Power Shell(ed) server's /control endpoint. The server
 // pushes browser commands ({t:'cmd', id, action, params, tabId}); we run them
