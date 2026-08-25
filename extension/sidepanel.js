@@ -13,6 +13,10 @@ let theme = {};         // global look overrides { border, termBg } (persisted a
 const DEFAULT_THEME = { border: '#0e4c00', termBg: '#000000' };   // filled from :root at boot
 const MAX_PANES = 6;
 const DEFAULT_FONT = 13, MIN_FONT = 6, MAX_FONT = 40;
+// Claude Code permission mode → icon (default mode shows none). Mirrors the map in
+// background.js (tab-group title). State colors live in CSS (.s-state.*).
+const MODE_EMOJI = { plan: '📋', acceptEdits: '⏩', bypassPermissions: '⚠️' };
+const STATE_LABEL = { busy: 'working', idle: 'your turn', waiting: 'waiting for you' };
 let currentTabId = null, currentWinId = null;
 let lastList = [];
 
@@ -160,6 +164,12 @@ function makePane(id) {
   term.onData((d) => { if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'in', d })); });
   // per-pane zoom: Ctrl +/- / Ctrl+0 (reset) — intercepted so it doesn't reach the shell or zoom the page
   term.attachCustomKeyEventHandler((e) => {
+    // Shift+Enter: also insert a newline instead of submitting (same as Ctrl+Enter below).
+    if (e.type === 'keydown' && e.key === 'Enter' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'in', d: '\x0a' }));
+      return false;
+    }
     if (e.type === 'keydown' && e.ctrlKey && !e.altKey && !e.metaKey) {
       if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomPane(pane, +1); return false; }
       if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomPane(pane, -1); return false; }
@@ -171,6 +181,14 @@ function makePane(id) {
       if (e.key === 'v' || e.key === 'V') {
         e.preventDefault();
         if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'in', d: '\x1bv\x16' }));
+        return false;
+      }
+      // Ctrl+Enter: real Claude Code TUI inserts a newline here, but a bare Enter in the
+      // pane submits. Swallow the Enter (no \r reaches the app) and send Ctrl+J (\x0a),
+      // which Claude Code reads as "insert newline".
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (pane.ws && pane.ws.readyState === 1) pane.ws.send(JSON.stringify({ t: 'in', d: '\x0a' }));
         return false;
       }
     }
@@ -210,6 +228,11 @@ function connectPane(pane) {
   sock.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
     if (m.t === 'hello') { pane.meta = m.session; pane.nm.textContent = m.session.name; pane.ic.textContent = m.session.icon || ''; updateHeader(); }
+    else if (m.t === 'state') {
+      if (pane.meta) { pane.meta.state = m.state; pane.meta.mode = m.mode; }
+      const it = lastList.find((s) => s.id === pane.id);
+      if (it) { it.state = m.state; it.mode = m.mode; renderList(lastList); }   // refresh the chip live
+    }
     else if (m.t === 'out') pane.term.write(m.d);
     else if (m.t === 'exit') pane.term.write(`\r\n\x1b[90m[process exited: ${m.code}]\x1b[0m\r\n`);
     else if (m.t === 'killed') pane.term.write(`\r\n\x1b[90m[terminal killed]\x1b[0m\r\n`);
@@ -507,9 +530,17 @@ function buildSessItem(s, boundIds, openIds) {
   // amber=alive but not docked anywhere here (replaces the old 📌 tag).
   const elsewhere = boundIds.has(s.id) && !here;
   const icState = s.exited ? 'dead' : (elsewhere ? 'elsewhere' : 'alive');
+  // Claude run-state dot (busy/idle/waiting) + permission-mode icon — only for
+  // claude sessions and while alive. Non-claude terminals show neither.
+  const cstate = (s.isClaude && !s.exited) ? (s.state || 'idle') : '';
+  const modeEmoji = (s.isClaude && !s.exited && MODE_EMOJI[s.mode]) || '';
+  const stateDot = cstate ? `<span class="s-state ${cstate}" title="${STATE_LABEL[cstate] || cstate}"></span>` : '';
+  const modeChip = modeEmoji ? `<span class="s-mode" title="${s.mode} mode">${modeEmoji}</span>` : '';
   li.innerHTML = `
+    ${stateDot}
     <span class="s-ic ${icState}"></span>
     <span class="s-name"></span>
+    ${modeChip}
     <span class="s-meta">${s.clients ? s.clients + '👁' : ''}</span>
     <button class="s-kill" title="Kill">✕</button>`;
   const icEl = li.querySelector('.s-ic');

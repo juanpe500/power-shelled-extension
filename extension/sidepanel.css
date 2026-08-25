@@ -33,6 +33,7 @@
     --ok: #22cc88;
     --amber: #e0a020;
     --bad: #bb2233;
+    --busy: #3b82f6;
     --kill: #aa5555;
     --kill-hover: #ee6666;
     --scroll-thumb: rgba(255, 255, 255, .16);
@@ -311,6 +312,12 @@ body {
 .s-ic.elsewhere { background: color-mix(in srgb, var(--amber) 80%, black); }
 .s-ic.dead { background: color-mix(in srgb, var(--bad) 70%, black); }
 .s-ic:hover { filter: brightness(1.15); }
+/* Claude run-state dot (busy=blue / idle=green / waiting=amber) + mode icon. */
+.s-state { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); }
+.s-state.busy { background: var(--busy); box-shadow: 0 0 5px var(--busy); }
+.s-state.idle { background: var(--ok); }
+.s-state.waiting { background: var(--amber); box-shadow: 0 0 5px var(--amber); }
+.s-mode { flex: 0 0 auto; font-size: 12px; line-height: 1; }
 .s-name { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; white-space: nowrap; }
 .s-name-head { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .s-name-suf { flex: 0 0 auto; }   /* the -NNN slug suffix — always fully visible */
