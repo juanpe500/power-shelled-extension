@@ -113,6 +113,13 @@ body {
 .tabs .tab:hover { color: var(--text-bright); background: var(--bg-hover); }
 .tabs .tab.active { color: var(--text-bright); border-bottom-color: var(--accent-hover); }
 .tabpane.hidden { display: none; }
+/* settings footer — persistent across tabs (Usage dashboard link) */
+.cfg-foot { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.cfg-foot .ghost {
+  background: transparent; border: 1px solid var(--border); color: var(--text-bright);
+  cursor: pointer; font: inherit; font-size: 12px; padding: 7px 12px; border-radius: 6px; width: 100%;
+}
+.cfg-foot .ghost:hover { background: var(--bg-hover); border-color: var(--accent-hover); }
 
 /* customization color pickers */
 .panel label.color-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -193,6 +200,23 @@ body {
 }
 .panel button.ws-chip:hover { background: var(--bg-control); border-color: var(--accent-hover); }
 .panel button.ws-chip.active { background: var(--sel); border-color: var(--accent-hover); color: var(--text-bright); }
+
+/* favorite-model badges — under Run-on-start, switch the command's --model flag */
+.model-badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+.model-badges:empty { display: none; }
+.panel button.model-badge {
+  padding: 3px 10px; border-radius: 14px; font-size: 11px; line-height: 1.4;
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  border: 1px solid var(--border); background: var(--bg-elevated); color: var(--text);
+  cursor: pointer; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.panel button.model-badge:hover { background: var(--bg-control); border-color: var(--accent-hover); }
+.panel button.model-badge.active { background: var(--sel); border-color: var(--accent-hover); color: var(--text-bright); }
+
+/* favorite-model editor rows (settings) */
+.model-list li { gap: 6px; cursor: default; }
+.model-list li:hover { background: var(--bg-control); }
+.model-list .model-id { flex: 1 1 auto; font-family: 'Cascadia Mono', Consolas, monospace; overflow: hidden; text-overflow: ellipsis; }
 
 /* favorites — horizontal chips (New terminal form, below Workspace) */
 .favs { margin-bottom: 8px; }

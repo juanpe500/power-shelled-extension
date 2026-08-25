@@ -293,9 +293,11 @@ function budgetLines(runCost, budgetUsd, windowTokens, budgetTokens, barW) {
   ];
 }
 
-function startDashboard({ getSessions, host, port, token, version, shells, restoredCount }) {
-  const tracker = createUsageTracker();
-  const history = createHistoryAggregator({ windowDays: 30, intervalMs: 20000 });
+function startDashboard({ getSessions, host, port, token, version, shells, restoredCount, tracker: extTracker, history: extHistory }) {
+  // Reuse the server's shared trackers when given (so we don't scan transcripts
+  // twice); otherwise stand up our own.
+  const tracker = extTracker || createUsageTracker();
+  const history = extHistory || createHistoryAggregator({ windowDays: 30, intervalMs: 20000 });
   const startedAt = Date.now();
   const costHistory = [];
   let lastAggCost = 0;
@@ -445,11 +447,12 @@ function startDashboard({ getSessions, host, port, token, version, shells, resto
   }
 
   // Cost/token tracking runs on its own async loop, off the render path — the
-  // render only reads the in-memory totals it accumulates.
-  tracker.start(getSessions, 1000);
+  // render only reads the in-memory totals it accumulates. Skip starting a loop
+  // we didn't create (the server already started the shared ones).
+  if (!extTracker) tracker.start(getSessions, 1000);
   // Historical per-day aggregation runs on its own slow loop (every 20s); the
   // render reads its in-memory day buckets, never the disk.
-  history.start();
+  if (!extHistory) history.start();
 
   const safeRender = () => { try { renderFrame(); } catch (_) {} };
   safeRender();

@@ -18,6 +18,11 @@ const { Server: McpServer } = require('@modelcontextprotocol/sdk/server/index.js
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 
+// Usage/history trackers — shared by the TUI dashboard AND the /dashboard/stats
+// JSON API, so headless mode (no TUI) still serves live stats to the extension.
+const { createUsageTracker } = require('./claude-usage');
+const { createHistoryAggregator, localDayKey } = require('./claude-history');
+
 const VERSION = '0.2.0';
 const HOST = process.env.CT_HOST || '127.0.0.1';
 const PORT = parseInt(process.env.CT_PORT || '3777', 10);
@@ -731,6 +736,67 @@ function attach(ws, s) {
 
 const restored = restoreSessions();
 
+// ---- usage/history stats (shared) --------------------------------------
+// Started here (not inside the TUI) so /dashboard/stats works even headless.
+// The TUI, when enabled, reuses these same instances instead of re-scanning.
+const usageTracker = createUsageTracker();
+const historyAgg = createHistoryAggregator({ windowDays: 30, intervalMs: 20000 });
+const SERVER_STARTED_AT = Date.now();
+usageTracker.start(() => sessions, 1000);
+historyAgg.start();
+
+function buildDashboardStats() {
+  const agg = usageTracker.getAggregate();
+  const sess = [...sessions.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map((s) => {
+      const sum = usageTracker.getSummary(s.id);
+      return {
+        id: s.id, name: s.name, shellId: s.shellId,
+        icon: s.icon || '', cwd: s.cwd || '',
+        isClaude: !!s.isClaude, exited: !!s.exited,
+        clients: s.clients ? s.clients.size : 0,
+        elapsedMs: Date.now() - s.createdAt,
+        bufferBytes: s.buffer ? s.buffer.length : 0,
+        state: s.state || 'idle', mode: s.mode || 'default',
+        costUsd: sum.costUsd, hasData: sum.hasData,
+        unknownModel: sum.unknownModel, models: sum.models,
+      };
+    });
+  const days = historyAgg.getSeries().map((d) => {
+    const perModel = {};
+    for (const [m, t] of d.perModel) {
+      perModel[m] = { inputTokens: t.inputTokens, outputTokens: t.outputTokens, costUsd: t.costUsd };
+    }
+    return { date: localDayKey(d.date), totals: { ...d.totals }, perModel };
+  });
+  const winTot = historyAgg.getWindowTotals();
+  return {
+    server: {
+      host: HOST, port: PORT, version: VERSION,
+      uptimeMs: Date.now() - SERVER_STARTED_AT,
+      restored: restored || 0, shells: SHELLS.map((s) => s.id),
+    },
+    run: {
+      costUsd: agg.costUsd, inputTokens: agg.inputTokens, outputTokens: agg.outputTokens,
+      cacheCreationTokens: agg.cacheCreationTokens, cacheReadTokens: agg.cacheReadTokens,
+      trackedSessionCount: agg.trackedSessionCount, totalSessions: sessions.size,
+    },
+    sessions: sess,
+    history: {
+      windowDays: historyAgg.windowDays, days,
+      topModels: historyAgg.getTopModels(5), windowTotals: { ...winTot },
+    },
+    budget: {
+      usd: parseFloat(process.env.CT_BUDGET_USD) || 20,
+      tokens: parseFloat(process.env.CT_BUDGET_TOKENS) || 100e6,
+    },
+  };
+}
+
+// Token-gated (not in the /health|/mcp exempt list). The extension page sends x-ct-token.
+app.get('/dashboard/stats', (_req, res) => res.json(buildDashboardStats()));
+
 function printBanner(restoredCount) {
   console.log('');
   console.log('  Power Shell(ed) server v' + VERSION);
@@ -751,6 +817,7 @@ server.listen(PORT, HOST, () => {
       startDashboard({
         getSessions: () => sessions, host: HOST, port: PORT, token: TOKEN,
         version: VERSION, shells: SHELLS, restoredCount: restored,
+        tracker: usageTracker, history: historyAgg,
       });
       return;
     } catch (err) {

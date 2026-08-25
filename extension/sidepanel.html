@@ -57,6 +57,7 @@
         </div>
       </div>
       <label>Run on start <input id="f-cmd" placeholder="e.g. cc viclix" /></label>
+      <div id="f-model-badges" class="model-badges"></div>
       <div class="row resume-row">
         <button type="button" id="f-resume">⟳ Resume a previous session…</button>
         <span id="f-resume-tag" class="resume-tag hidden"></span>
@@ -72,6 +73,7 @@
       <div class="tabs" id="cfgTabs">
         <button type="button" class="tab active" data-tab="tab-server">Server settings</button>
         <button type="button" class="tab" data-tab="tab-ws">Workspaces</button>
+        <button type="button" class="tab" data-tab="tab-models">Favorite models</button>
         <button type="button" class="tab" data-tab="tab-custom">Customization</button>
       </div>
 
@@ -99,6 +101,18 @@
         <div class="row"><button id="ws-add">＋ Add workspace</button></div>
       </div>
 
+      <!-- Favorite models tab — badges under Run-on-start switch the --model flag -->
+      <div id="tab-models" class="tabpane hidden">
+        <div class="hint" style="margin-top:0">Models offered as badges under “Run on start”. Tap ☆ to set the one new terminals default to. Saved in the browser.</div>
+        <ul id="modelList" class="sess-list model-list"></ul>
+        <div class="panel-empty" id="modelEmpty">No models yet — add one below.</div>
+        <div class="row">
+          <input id="model-name" placeholder="model id (e.g. claude-sonnet-5)" />
+          <button id="model-add">＋ Add</button>
+        </div>
+        <div class="row"><button id="model-reset">Reset to defaults</button></div>
+      </div>
+
       <!-- Customization tab (global, applies to every terminal + tab) -->
       <div id="tab-custom" class="tabpane hidden">
         <div class="hint" style="margin-top:0">Global look — one setting for all terminals and tabs.</div>
@@ -109,6 +123,10 @@
           <span class="color-ctl"><span class="color-hex" id="cust-termbg-hex"></span><input type="color" id="cust-termbg" /></span>
         </label>
         <div class="row"><button id="cust-reset">Reset to defaults</button></div>
+      </div>
+
+      <div class="cfg-foot">
+        <button id="c-dashboard" type="button" class="ghost">📊 Usage dashboard ↗</button>
       </div>
     </div>
 

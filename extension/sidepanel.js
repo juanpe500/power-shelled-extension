@@ -11,6 +11,11 @@ let focusedId = null;   // which pane has focus (drives the top-bar title + conn
 let zoomStore = {};     // { sessionId: fontSizePx } — per-session zoom (persisted as ct_zoom)
 let theme = {};         // global look overrides { border, termBg } (persisted as ct_theme)
 const DEFAULT_THEME = { border: '#0e4c00', termBg: '#000000' };   // filled from :root at boot
+// Favorite Claude models (persisted as ct_models). `list` = badges under Run-on-start,
+// `default` = the one new terminals build their command with. Seeded once at boot.
+const DEFAULT_MODELS = { list: ['claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5', 'claude-fable-5'], default: 'claude-opus-4-8' };
+let models = { list: [...DEFAULT_MODELS.list], default: DEFAULT_MODELS.default };
+let pickModel = '';     // model chosen for the current New-terminal command ('' → models.default)
 const MAX_PANES = 6;
 const DEFAULT_FONT = 13, MIN_FONT = 6, MAX_FONT = 40;
 // Claude Code permission mode → icon (default mode shows none). Mirrors the map in
@@ -39,12 +44,14 @@ async function api(path, opts = {}) {
 // ---- storage ------------------------------------------------------------
 function loadState() {
   return new Promise((res) => {
-    chrome.storage.local.get(['ct_cfg', 'ct_panes', 'ct_bindings', 'ct_zoom', 'ct_workspaces', 'ct_favorites', 'ct_theme'], (o) => {
+    chrome.storage.local.get(['ct_cfg', 'ct_panes', 'ct_bindings', 'ct_zoom', 'ct_workspaces', 'ct_favorites', 'ct_theme', 'ct_models'], (o) => {
       if (o.ct_cfg) cfg = { ...DEFAULTS, ...o.ct_cfg };
       zoomStore = o.ct_zoom || {};
       theme = o.ct_theme || {};
       workspaces = o.ct_workspaces || [];
       favorites = o.ct_favorites || [];
+      if (o.ct_models && Array.isArray(o.ct_models.list)) models = normModels(o.ct_models);
+      else { models = { list: [...DEFAULT_MODELS.list], default: DEFAULT_MODELS.default }; saveModels(); }
       if (o.ct_panes) paneStore = o.ct_panes;
       else if (o.ct_bindings) {                 // migrate old one-session-per-tab format
         paneStore = {};
@@ -96,6 +103,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes.ct_workspaces) { workspaces = changes.ct_workspaces.newValue || []; renderWsChips(); renderWsEditor(); }
   if (changes.ct_favorites) { favorites = changes.ct_favorites.newValue || []; renderFavList(); renderDrawerFavs(); updateFavStar(); }
   if (changes.ct_theme) { theme = changes.ct_theme.newValue || {}; applyTheme(); populateCustomInputs(); }
+  if (changes.ct_models) {
+    models = changes.ct_models.newValue ? normModels(changes.ct_models.newValue) : { list: [...DEFAULT_MODELS.list], default: DEFAULT_MODELS.default };
+    if (pickModel && !models.list.includes(pickModel)) pickModel = '';
+    renderModelBadges(); renderModelEditor();
+  }
 });
 
 // ---- panes (multi-terminal grid) ----------------------------------------
@@ -863,7 +875,66 @@ function makeName(dir) {
 // survives the resume.
 function buildCmd() {
   if (!pickCwd) return '';
-  return `claude --model claude-opus-4-8 --remote-control ${pickName}${resumeUuid ? ' --resume ' + resumeUuid : ''}`;
+  const model = pickModel || models.default || DEFAULT_MODELS.default;
+  return `claude --model ${model} --remote-control ${pickName}${resumeUuid ? ' --resume ' + resumeUuid : ''}`;
+}
+
+// ---- favorite models (badges under Run-on-start + settings editor) ------
+function saveModels() { chrome.storage.local.set({ ct_models: models }); }
+// Clean a stored/incoming shape: dedupe, drop blanks, keep a valid default.
+function normModels(m) {
+  const seen = new Set();
+  const list = (m.list || []).map((s) => String(s).trim()).filter((s) => s && !seen.has(s) && seen.add(s));
+  let def = String(m.default || '').trim();
+  if (!list.includes(def)) def = list[0] || '';
+  return { list, default: def };
+}
+function effModel() { return pickModel || models.default || DEFAULT_MODELS.default; }
+// Chips under Run-on-start: click one to switch the command's --model to it.
+function renderModelBadges() {
+  const box = $('f-model-badges'); if (!box) return;
+  box.innerHTML = '';
+  const active = effModel();
+  models.list.forEach((m) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'model-badge' + (m === active ? ' active' : '');
+    b.textContent = m; b.title = 'Use ' + m;
+    b.addEventListener('click', () => setPickModel(m));
+    box.appendChild(b);
+  });
+}
+// Switch the model for the New-terminal command. Rebuilds the auto command, or
+// surgically swaps the --model token when the user has hand-edited the command.
+function setPickModel(m) {
+  pickModel = m;
+  const inp = $('f-cmd');
+  if (cmdAuto) inp.value = buildCmd();
+  else if (/--model\s+\S+/.test(inp.value)) inp.value = inp.value.replace(/--model\s+\S+/, '--model ' + m);
+  renderModelBadges();
+}
+// Settings editor (Favorite models tab): reorder-free list with a ☆/★ default
+// toggle and a remove button per row, plus an add field.
+function renderModelEditor() {
+  const ul = $('modelList'); if (!ul) return;
+  ul.innerHTML = '';
+  $('modelEmpty').classList.toggle('hidden', models.list.length > 0);
+  models.list.forEach((m, i) => {
+    const isDef = m === models.default;
+    const li = document.createElement('li');
+    li.innerHTML =
+      `<button class="fav-star${isDef ? ' on' : ''}" title="${isDef ? 'Default for new terminals' : 'Set as default for new terminals'}">${isDef ? '★' : '☆'}</button>` +
+      `<span class="s-name model-id"></span><button class="s-kill" title="Remove model">✕</button>`;
+    li.querySelector('.model-id').textContent = m;
+    li.querySelector('.fav-star').addEventListener('click', () => { models.default = m; saveModels(); renderModelEditor(); renderModelBadges(); });
+    li.querySelector('.s-kill').addEventListener('click', () => {
+      models.list.splice(i, 1);
+      models = normModels(models);          // re-pick default if we removed it
+      if (pickModel === m) pickModel = '';
+      saveModels(); renderModelEditor(); renderModelBadges();
+    });
+    ul.appendChild(li);
+  });
 }
 
 function updateCwd() {
@@ -879,6 +950,7 @@ function updateCwd() {
   if (cmdAuto) $('f-cmd').value = buildCmd();
   if (nameAuto) $('f-name').value = pickName;   // Name mirrors the RC name (e.g. mdgraphs-481)
   updateFavStar(); renderFavList();             // keep star + active favorite highlight in sync
+  renderModelBadges();                          // keep the active-model badge in sync with the command
 }
 function renderCrumbs() {
   const c = $('f-crumbs'); c.innerHTML = '';
@@ -1107,16 +1179,21 @@ $('title').addEventListener('click', () => {
 $('cfgBtn').addEventListener('click', () => {
   $('c-host').value = cfg.host; $('c-port').value = cfg.port;
   $('c-token').value = cfg.token;
-  renderWsEditor(); populateCustomInputs(); cfgSelectTab('tab-server');
+  renderWsEditor(); renderModelEditor(); populateCustomInputs(); cfgSelectTab('tab-server');
   toggle('cfgForm');
 });
-// settings tabs (Server / Workspaces / Customization)
+// settings tabs (Server / Workspaces / Favorite models / Customization)
 function cfgSelectTab(id) {
   for (const b of $('cfgTabs').querySelectorAll('.tab')) b.classList.toggle('active', b.dataset.tab === id);
-  for (const p of ['tab-server', 'tab-ws', 'tab-custom']) $(p).classList.toggle('hidden', p !== id);
+  for (const p of ['tab-server', 'tab-ws', 'tab-models', 'tab-custom']) $(p).classList.toggle('hidden', p !== id);
 }
 $('cfgTabs').addEventListener('click', (e) => {
   const btn = e.target.closest('.tab'); if (btn) cfgSelectTab(btn.dataset.tab);
+});
+// Open the usage dashboard (extension page) in its own tab — reads host/port/token
+// from the same stored cfg, so it self-connects.
+$('c-dashboard').addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('dashboard.html') });
 });
 // customization color pickers — live preview on input, persist on commit
 $('cust-border').addEventListener('input', (e) => {
@@ -1138,11 +1215,29 @@ $('ws-add').addEventListener('click', () => {
   saveWorkspaces(); renderWsEditor(); renderWsChips();
   $('ws-name').value = ''; $('ws-path').value = '';
 });
+// favorite models editor: add a model id, or reset the list to the defaults
+function addModel() {
+  const name = $('model-name').value.trim();
+  if (!name) { setStatus('enter a model id (e.g. claude-sonnet-5)'); return; }
+  if (models.list.includes(name)) { setStatus('that model is already in the list'); $('model-name').value = ''; return; }
+  models.list.push(name);
+  if (!models.default) models.default = name;   // first-ever model becomes the default
+  saveModels(); renderModelEditor(); renderModelBadges();
+  $('model-name').value = '';
+}
+$('model-add').addEventListener('click', addModel);
+$('model-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addModel(); } });
+$('model-reset').addEventListener('click', () => {
+  models = { list: [...DEFAULT_MODELS.list], default: DEFAULT_MODELS.default };
+  pickModel = '';
+  saveModels(); renderModelEditor(); renderModelBadges();
+});
 function openNewForm() {
   loadShells(); renderFavList();
   wsSel = ''; renderWsChips();
   $('f-icon').value = '';
   $('emojiPop').classList.add('hidden');
+  pickModel = ''; renderModelBadges();          // default model until a badge is tapped
   cmdAuto = true; nameAuto = true; resumeUuid = ''; updateResumeTag();
   resetPicker();                          // clears cwd + Name + Run-on-start
   hidePanels(); $('newForm').classList.remove('hidden'); syncPanelBtns();

@@ -5,6 +5,7 @@ node_modules/
 .token
 .sessions.json
 .claude-hooks.json
+*.log
 *.env
 .env
 !.env.example

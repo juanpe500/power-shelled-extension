@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Power Shell(ed) — Dashboard</title>
+  <link rel="stylesheet" href="vendor/xterm.css" />
+  <link rel="stylesheet" href="dashboard.css" />
+</head>
+<body>
+  <header id="top">
+    <div class="brand">
+      <span class="logo">📊</span>
+      <div>
+        <div class="title">Power Shell(ed)</div>
+        <div id="serverline" class="sub">connecting…</div>
+      </div>
+    </div>
+    <nav id="viewTabs" class="view-tabs">
+      <button class="vtab active" data-view="usage">Usage</button>
+      <button class="vtab" data-view="agents">Agents <span id="agentsBadge" class="badge-n hidden"></span></button>
+    </nav>
+    <div class="top-right">
+      <span id="conn" class="conn off" title="connection">●</span>
+      <button id="refresh" title="Refresh now">↻</button>
+    </div>
+  </header>
+
+  <div id="offline" class="offline hidden">
+    Can't reach the server. Open the side panel's ⚙ settings, check host/port/token,
+    and that the server is running.
+  </div>
+
+  <main id="view-usage">
+    <section class="cards" id="cards"></section>
+
+    <section class="grid2">
+      <div class="card">
+        <div class="card-h">Budget</div>
+        <div id="budget"></div>
+      </div>
+      <div class="card">
+        <div class="card-h">Activity (30d)</div>
+        <div id="heatmap" class="heatmap"></div>
+        <div class="heat-legend"><span>Less</span><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><span>More</span></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-h">Tokens / day (30d)</div>
+      <div id="legend" class="legend"></div>
+      <canvas id="chart" height="220"></canvas>
+    </section>
+
+    <section class="card">
+      <div class="card-h">Sessions</div>
+      <div class="table-wrap">
+        <table id="sessions">
+          <thead>
+            <tr><th>Name</th><th>Shell</th><th class="num">Elapsed</th><th class="num">Size</th><th class="num">Cli</th><th>State</th><th>Model(s)</th><th class="num">Cost</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <main id="view-agents" class="hidden">
+    <section id="agentsSummary" class="ag-summary"></section>
+    <section id="agentsGrid" class="ag-grid"></section>
+  </main>
+
+  <div id="tray" class="tray hidden"></div>
+
+  <script src="vendor/xterm.js"></script>
+  <script src="vendor/addon-fit.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>
