@@ -38,28 +38,83 @@ chrome.action.onClicked.addListener((tab) => {
 // Marks in the tab strip which tabs own a terminal, and PERSISTS while the side
 // panel is closed. Emptying a tab's panes (kill/close all) ungroups the tab.
 const GROUP_TITLE = 'PS';
-const GROUP_COLOR = 'orange';
-let tabTitles = {};   // { tabId: composed title } mirror of ct_tabtitle
+const GROUP_COLOR = 'orange';                 // default: terminal tab with no claude state
+// Claude run-state → tab-group color. A tab with several sessions takes the
+// highest-priority state (waiting beats busy beats idle).
+const STATE_COLORS = { busy: 'blue', idle: 'green', waiting: 'yellow' };
+const STATE_PRIORITY = { waiting: 3, busy: 2, idle: 1 };
+// Every color we might paint a group — used to recognize "one of ours" now that
+// the color varies by state (it used to be a bare `=== 'orange'` check).
+const OUR_COLORS = new Set([GROUP_COLOR, ...Object.values(STATE_COLORS)]);
+// permission mode → title-prefix icon (default mode: none). Mirrors sidepanel.js.
+const MODE_EMOJI = { plan: '📋', acceptEdits: '⏩', bypassPermissions: '⚠️' };
 
-function titleFor(tabId) { return tabTitles[tabId] || GROUP_TITLE; }
+let tabTitles = {};      // { tabId: composed title } mirror of ct_tabtitle
+let panesMirror = {};    // { tabId: {ids:[sessionId,...]} } mirror of ct_panes
+let sessionState = {};   // { sessionId: {state, mode} } pushed by the server (/control)
+
+// Aggregate the claude state+mode of a tab from its sessions. Only sessions that
+// have actually reported count; a tab with none (non-claude, or not yet reported)
+// returns state:null → default color, no mode icon.
+function tabAggState(tabId) {
+  const rec = panesMirror[tabId];
+  const ids = rec && Array.isArray(rec.ids) ? rec.ids : [];
+  let best = null;
+  for (const id of ids) {
+    const st = sessionState[id];
+    if (!st || !st.state) continue;
+    if (!best || (STATE_PRIORITY[st.state] || 0) > (STATE_PRIORITY[best.state] || 0)) best = st;
+  }
+  return best || { state: null, mode: 'default' };
+}
+function colorFor(tabId) {
+  const a = tabAggState(tabId);
+  return a.state ? (STATE_COLORS[a.state] || GROUP_COLOR) : GROUP_COLOR;
+}
+function titleFor(tabId) {
+  const base = tabTitles[tabId] || GROUP_TITLE;
+  const emoji = MODE_EMOJI[tabAggState(tabId).mode] || '';
+  return emoji ? `${emoji} ${base}` : base;
+}
 
 async function ensureGrouped(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
     const want = titleFor(tabId);
+    const wantColor = colorFor(tabId);
     if (tab.groupId && tab.groupId !== -1) {
       const g = await chrome.tabGroups.get(tab.groupId);
-      if (g.color === GROUP_COLOR) {   // one of ours → just keep the title current
-        if (g.title !== want) await chrome.tabGroups.update(tab.groupId, { title: want });
+      if (OUR_COLORS.has(g.color)) {   // one of ours → keep title + state color current
+        const upd = {};
+        if (g.title !== want) upd.title = want;
+        if (g.color !== wantColor) upd.color = wantColor;
+        if (Object.keys(upd).length) await chrome.tabGroups.update(tab.groupId, upd);
         return;
       }
     }
     const gid = await chrome.tabs.group({ tabIds: [tabId] });
-    await chrome.tabGroups.update(gid, { title: want, color: GROUP_COLOR });
+    await chrome.tabGroups.update(gid, { title: want, color: wantColor });
   } catch (_) {}
 }
 async function ungroup(tabId) {
   try { await chrome.tabs.ungroup(tabId); } catch (_) {}
+}
+
+// The server pushes a session's Claude state/mode over /control. Store it and
+// recolor/re-title every tab that hosts that session. Works with the panel closed
+// and for background tabs (unlike the panel, which only sees its own tab).
+async function applySessionState({ id, state, mode }) {
+  if (!id) return;
+  sessionState[id] = { state, mode };
+  try {
+    if (!Object.keys(panesMirror).length) {
+      const { ct_panes } = await chrome.storage.local.get('ct_panes');
+      panesMirror = ct_panes || {};
+    }
+  } catch (_) {}
+  for (const [t, rec] of Object.entries(panesMirror)) {
+    if (rec && Array.isArray(rec.ids) && rec.ids.includes(id)) ensureGrouped(Number(t));
+  }
 }
 
 // tabs of a ct_panes map that currently hold ≥1 pane
@@ -82,10 +137,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
     for (const id of ids) if (prev[id] !== tabTitles[id]) ensureGrouped(Number(id));
   }
   if (changes.ct_panes) {
+    panesMirror = changes.ct_panes.newValue || {};
     const oldTabs = tabsWithPanes(changes.ct_panes.oldValue);
     const newTabs = tabsWithPanes(changes.ct_panes.newValue);
-    for (const t of newTabs) if (!oldTabs.has(t)) ensureGrouped(t);
     for (const t of oldTabs) if (!newTabs.has(t)) ungroup(t);
+    // Re-apply to every tab that still has panes: its session set (and so its
+    // aggregated state color / title) may have changed, not only newly-added tabs.
+    for (const t of newTabs) ensureGrouped(t);
   }
 });
 
@@ -94,6 +152,7 @@ async function reconcileGroups() {
   try {
     const { ct_panes, ct_tabtitle } = await chrome.storage.local.get(['ct_panes', 'ct_tabtitle']);
     tabTitles = ct_tabtitle || {};
+    panesMirror = ct_panes || {};
     for (const id of tabsWithPanes(ct_panes)) {
       try { await chrome.tabs.get(id); } catch (_) { continue; }
       ensureGrouped(id);
@@ -114,7 +173,7 @@ async function maybeAdoptGroupSessions(tabId, groupId) {
   try {
     let g;
     try { g = await chrome.tabGroups.get(groupId); } catch (_) { return; }
-    if (!g || g.color !== GROUP_COLOR) return;                 // not one of ours
+    if (!g || !OUR_COLORS.has(g.color)) return;                // not one of ours
 
     const { ct_panes: store, ct_tabtitle: titles } =
       await chrome.storage.local.get(['ct_panes', 'ct_tabtitle']);
@@ -192,6 +251,7 @@ async function connectControl() {
     let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
     if (m.t === 'cmd') handleCommand(m);
     else if (m.t === 'ping') { try { ws.send(JSON.stringify({ t: 'pong' })); } catch (_) {} }
+    else if (m.t === 'sstate') applySessionState(m);
   };
   const retry = () => {
     controlConnecting = false;
@@ -413,7 +473,7 @@ async function ensureHud(tabId, silent) {
 // don't have to be re-invented as ad-hoc eval'd JS each time. A navigation
 // drops it → ensureHud() reinstalls (idempotent, version-guarded).
 function injHud() {
-  const V = 2;
+  const V = 3;
   if (window.__CTHUD && window.__CTHUD.v === V) return { ready: true };
   const Z = 2147483600;
   const HOLD = 2500;   // how long decorations linger before fading (ms)
@@ -462,7 +522,59 @@ function injHud() {
         await sleep(450);
       }
     },
-    highlight(node, opts) { if (node) this.highlightRect(node.getBoundingClientRect(), opts); },
+    // Element highlight that STAYS GLUED to the node as the page scrolls/resizes.
+    // (A batch fill can scroll the page while earlier field highlights are still
+    // visible — a one-shot fixed rect would freeze mid-screen. So re-place on scroll.)
+    highlight(node, opts) {
+      if (!node) return;
+      opts = opts || {};
+      const pad = opts.pad == null ? 3 : opts.pad;
+      const color = opts.color || '#3b82f6';
+      const dur = opts.duration == null ? HOLD : opts.duration;
+      const box = mk({
+        position: 'fixed', border: '2px solid ' + color, borderRadius: '6px', zIndex: String(Z + 3),
+        pointerEvents: 'none', boxShadow: '0 0 0 3px ' + color + '33, 0 4px 18px ' + color + '55',
+        opacity: '0', transform: 'scale(1.04)', boxSizing: 'border-box',
+        transition: 'opacity .16s ease, transform .16s ease',
+      });
+      let tag = null;
+      if (opts.label) {
+        tag = mk({
+          position: 'fixed', font: '600 11px/1 -apple-system,"Segoe UI",Roboto,sans-serif', color: '#fff',
+          background: color, padding: '3px 7px', borderRadius: '5px', zIndex: String(Z + 4),
+          pointerEvents: 'none', whiteSpace: 'nowrap', maxWidth: '60vw', overflow: 'hidden',
+          textOverflow: 'ellipsis', opacity: '0', transition: 'opacity .16s ease',
+        });
+        tag.textContent = opts.label;
+      }
+      const place = () => {
+        const r = node.getBoundingClientRect();
+        box.style.left = (r.left - pad) + 'px'; box.style.top = (r.top - pad) + 'px';
+        box.style.width = (r.width + pad * 2) + 'px'; box.style.height = (r.height + pad * 2) + 'px';
+        if (tag) { tag.style.left = (r.left - pad) + 'px'; tag.style.top = (r.top - pad - 20) + 'px'; }
+      };
+      place();
+      let raf = 0;
+      const onScroll = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; place(); }); };
+      addEventListener('scroll', onScroll, true); // capture → also catches inner scroll containers
+      addEventListener('resize', onScroll);
+      const cleanup = () => {
+        removeEventListener('scroll', onScroll, true); removeEventListener('resize', onScroll);
+        if (raf) cancelAnimationFrame(raf);
+        box.remove(); if (tag) tag.remove();
+      };
+      requestAnimationFrame(() => {
+        box.style.opacity = '1'; box.style.transform = 'scale(1)';
+        if (tag) tag.style.opacity = '1';
+      });
+      if (!opts.persist) {
+        setTimeout(() => {
+          box.style.opacity = '0'; if (tag) tag.style.opacity = '0';
+          setTimeout(cleanup, 250);
+        }, dur);
+      }
+      return cleanup;
+    },
     highlightRect(r, opts) {
       opts = opts || {};
       const pad = opts.pad == null ? 3 : opts.pad;

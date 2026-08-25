@@ -18,7 +18,7 @@ const { Server: McpServer } = require('@modelcontextprotocol/sdk/server/index.js
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const HOST = process.env.CT_HOST || '127.0.0.1';
 const PORT = parseInt(process.env.CT_PORT || '3777', 10);
 const MAX_BUF = 256 * 1024; // scrollback bytes kept per session for reattach
@@ -85,6 +85,42 @@ function ptyBaseEnv() {
   return env;
 }
 
+// ---- Claude Code state/mode hooks ---------------------------------------
+// We inject a hooks settings file into every claude the manager spawns (via the
+// --settings flag, which MERGES with the user's global config, not replaces it),
+// so each session reports its state (busy/idle/waiting) + permission mode back to
+// this server. claude-hook.js does the POST; it inherits CT_SESSION_ID/CT_TOKEN/
+// CT_PORT from the PTY env to know which session it is and how to reach us.
+const HOOK_SCRIPT = path.join(__dirname, 'claude-hook.js').replace(/\\/g, '/');
+const HOOK_SETTINGS_PATH = path.join(__dirname, '.claude-hooks.json');
+const hookCmd = (event) => `node "${HOOK_SCRIPT}" ${event}`;
+function writeHookSettings() {
+  const settings = {
+    hooks: {
+      UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd('prompt') }] }],
+      Stop:             [{ hooks: [{ type: 'command', command: hookCmd('stop') }] }],
+      // No matcher → fires on every notification; all of them mean "waiting on you"
+      // (permission prompt / idle prompt). Rare informational ones self-correct on
+      // the next prompt/stop. Guarantees the waiting state without regex-matcher risk.
+      Notification:     [{ hooks: [{ type: 'command', command: hookCmd('notify') }] }],
+      // startup|resume so a RESTORED session reports its initial mode immediately,
+      // without flipping to idle on a mid-work /compact.
+      SessionStart:     [{ matcher: 'startup|resume', hooks: [{ type: 'command', command: hookCmd('start') }] }],
+    },
+  };
+  try { fs.writeFileSync(HOOK_SETTINGS_PATH, JSON.stringify(settings, null, 2)); } catch (_) {}
+}
+writeHookSettings();
+
+// Append our hooks --settings to a claude launch command, once. Applies to new AND
+// restored sessions (the restore path re-runs this via the Session ctor). Leaves a
+// user-provided --settings alone.
+function withHookSettings(cmd) {
+  if (!isClaudeCmd(cmd)) return cmd;
+  if (/(^|\s)--settings(\s|=)/.test(cmd)) return cmd;
+  return `${cmd} --settings "${HOOK_SETTINGS_PATH}"`;
+}
+
 class Session {
   constructor({ name, shellId, cwd, cols, rows, initialCommand, icon, id, claudeUuid }) {
     if (id) {
@@ -103,7 +139,7 @@ class Session {
     this.cols = clampInt(cols, 20, 500, 100);
     this.rows = clampInt(rows, 5, 200, 30);
     const resolved = resolveClaudeCmd(initialCommand);
-    this.initialCommand = resolved.cmd;
+    this.initialCommand = withHookSettings(resolved.cmd);
     // The transcript id is pinned via --session-id (fresh launch) or carried over
     // from the snapshot (restore) — known up front, so --resume is deterministic.
     this.claudeUuid = claudeUuid || resolved.uuid || null;
@@ -113,6 +149,10 @@ class Session {
     this.exitCode = null;
     this.buffer = '';
     this.clients = new Set();
+    // Claude run-state (busy|idle|waiting) + permission mode, driven by the hooks
+    // injected via --settings. Non-claude sessions never report → stay 'idle'.
+    this.state = 'idle';
+    this.mode = 'default';
 
     this.pty = pty.spawn(sh.cmd, sh.args, {
       name: 'xterm-256color',
@@ -121,8 +161,9 @@ class Session {
       cwd: this.cwd,
       // CT_SESSION_ID lets the claude in this PTY tell the MCP server which
       // terminal it is (via .mcp.json header) → browser commands target the tab
-      // this session is docked next to.
-      env: { ...ptyBaseEnv(), CT_SESSION_ID: this.id },
+      // this session is docked next to. CT_TOKEN/CT_PORT/CT_HOST let the state
+      // hooks (claude-hook.js) POST this session's state/mode back to us.
+      env: { ...ptyBaseEnv(), CT_SESSION_ID: this.id, CT_TOKEN: TOKEN, CT_PORT: String(PORT), CT_HOST: HOST },
     });
 
     this.pty.onData((d) => {
@@ -172,6 +213,7 @@ class Session {
       id: this.id, name: this.name, icon: this.icon, shellId: this.shellId, shellLabel: this.shellLabel,
       cwd: this.cwd, cols: this.cols, rows: this.rows, createdAt: this.createdAt,
       exited: this.exited, exitCode: this.exitCode, clients: this.clients.size,
+      isClaude: this.isClaude, state: this.state, mode: this.mode,
     };
   }
 }
@@ -248,6 +290,13 @@ class NoControlClient extends Error {}
 function attachControl(ws) {
   controlClients.add(ws);
   try { ws.send(JSON.stringify({ t: 'welcome', version: VERSION })); } catch (_) {}
+  // Seed the background SW with current claude states so a (re)connecting worker
+  // recolors existing tab groups immediately, not only on the next transition.
+  for (const s of sessions.values()) {
+    if (s.isClaude && !s.exited) {
+      try { ws.send(JSON.stringify({ t: 'sstate', id: s.id, state: s.state, mode: s.mode })); } catch (_) {}
+    }
+  }
 
   ws.on('message', (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch (_) { return; }
@@ -282,6 +331,14 @@ setInterval(() => {
   for (const ws of controlClients) { if (ws.readyState === 1) { try { ws.send(ping); } catch (_) {} } }
 }, 20000);
 
+// Push a message to every connected control client (the extension's background SW).
+// Used to broadcast session state so the tab-group colors update even with no panel
+// open and for background tabs.
+function broadcastControl(msg) {
+  const s = JSON.stringify(msg);
+  for (const ws of controlClients) { if (ws.readyState === 1) { try { ws.send(s); } catch (_) {} } }
+}
+
 function sendBrowserCommand({ action, params, tabId, sessionId, timeoutMs }) {
   return new Promise((resolve, reject) => {
     const ws = [...controlClients].find(w => w.readyState === 1);
@@ -312,9 +369,9 @@ const MCP_TOOLS = [
     inputSchema: { type: 'object', properties: { ...numTab } } },
   { name: 'browser_eval', description: 'Run JavaScript in the page (MAIN world) and return the result. The value of the last expression is returned; it must be JSON-serializable.',
     inputSchema: { type: 'object', properties: { code: { type: 'string', description: 'JavaScript to evaluate in the page.' }, ...numTab }, required: ['code'] } },
-  { name: 'browser_click', description: 'Click an element by CSS selector, OR at page coordinates (x,y). Coordinates use a trusted CDP mouse click.',
-    inputSchema: { type: 'object', properties: { selector: { type: 'string', description: 'CSS selector to click.' }, x: { type: 'number' }, y: { type: 'number' }, ...numTab } } },
-  { name: 'browser_type', description: 'Type text. With a selector it focuses that element and sets its value; with trusted:true it sends real keystrokes via CDP to the focused element. submit:true presses Enter afterward.',
+  { name: 'browser_click', description: 'Click an element. ALWAYS prefer a CSS selector — target the specific control, e.g. a scoped selector or one matched by nearby text. Coordinates (x,y) are a last-resort fallback for canvas / non-DOM targets and must come from a real screenshot or DOM position; NEVER guess pixel coordinates. Note: a bare [type=submit] selector can match the WRONG button on the page (e.g. a logout form) — scope it to the intended form/button.',
+    inputSchema: { type: 'object', properties: { selector: { type: 'string', description: 'CSS selector to click (preferred). Scope it to the exact control.' }, x: { type: 'number', description: 'Fallback only. Real coordinate from a screenshot/DOM — never a guess.' }, y: { type: 'number', description: 'Fallback only. Real coordinate from a screenshot/DOM — never a guess.' }, ...numTab } } },
+  { name: 'browser_type', description: 'Type text into an element. ALWAYS pass a CSS selector to target the field (do not rely on focus / pixel position). It focuses that element and sets its value; with trusted:true it sends real keystrokes via CDP to the focused element. submit:true presses Enter afterward. To fill several fields at once, prefer browser_batch.',
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, selector: { type: 'string' }, trusted: { type: 'boolean' }, submit: { type: 'boolean' }, ...numTab }, required: ['text'] } },
   { name: 'browser_key', description: 'Press a single key as a real CDP key event, e.g. Enter, Tab, Escape, ArrowDown.',
     inputSchema: { type: 'object', properties: { key: { type: 'string' }, ...numTab }, required: ['key'] } },
@@ -324,7 +381,33 @@ const MCP_TOOLS = [
     inputSchema: { type: 'object', properties: { url: { type: 'string' }, ...numTab }, required: ['url'] } },
   { name: 'browser_wait_for', description: 'Wait until a CSS selector appears on the page, polling until it matches or timeoutMs elapses. visible:true also requires the element to be visible (rendered, non-zero size). Returns { found:true, waitedMs }; errors on timeout.',
     inputSchema: { type: 'object', properties: { selector: { type: 'string', description: 'CSS selector to wait for.' }, timeoutMs: { type: 'number', description: 'Max time to wait in ms (default 10000).' }, visible: { type: 'boolean', description: 'Also require the element to be visible, not just present in the DOM.' }, ...numTab }, required: ['selector'] } },
+  { name: 'browser_batch', description: 'Run several browser actions in ONE call, in order, without round-tripping per action. Ideal for form fills and validate-after flows: e.g. type into 3 fields, click submit, then screenshot/read to confirm — all in a single tool call. Steps run sequentially; if a step fails it STOPS there and returns the results so far plus the error (so a failed field-fill never reaches the submit click). Any screenshot/read step returns its output inline (screenshots as image blocks), so you can validate the result without a follow-up call. Each step is { action, ...params } using the same params as the matching browser_* tool.',
+    inputSchema: { type: 'object', properties: {
+      steps: { type: 'array', description: 'Ordered list of actions to run.', items: { type: 'object', properties: {
+        action: { type: 'string', enum: ['type', 'click', 'key', 'navigate', 'wait_for', 'read', 'screenshot', 'eval', 'list_tabs'], description: 'The action for this step (matches the browser_* tool without the prefix; "read" = browser_read).' },
+        selector: { type: 'string', description: 'For type/click/wait_for. Prefer selectors over coordinates.' },
+        text: { type: 'string', description: 'For type.' },
+        x: { type: 'number', description: 'For click fallback only — never guess.' },
+        y: { type: 'number', description: 'For click fallback only — never guess.' },
+        key: { type: 'string', description: 'For key, e.g. Enter, Tab.' },
+        url: { type: 'string', description: 'For navigate.' },
+        code: { type: 'string', description: 'For eval.' },
+        trusted: { type: 'boolean', description: 'For type — send real CDP keystrokes.' },
+        submit: { type: 'boolean', description: 'For type — press Enter afterward.' },
+        fullPage: { type: 'boolean', description: 'For screenshot.' },
+        visible: { type: 'boolean', description: 'For wait_for.' },
+        timeoutMs: { type: 'number', description: 'For wait_for.' },
+        tabId: { type: 'number', description: 'Override the batch tabId for this step.' },
+      }, required: ['action'] } },
+      ...numTab,
+    }, required: ['steps'] } },
 ];
+// Friendly step action -> raw extension action for browser_batch.
+const BATCH_ACTIONS = {
+  type: 'type', click: 'click', key: 'key', navigate: 'navigate',
+  wait_for: 'wait_for', read: 'read_page', screenshot: 'screenshot',
+  eval: 'eval', list_tabs: 'list_tabs',
+};
 const TOOL_ACTION = {
   browser_list_tabs: 'list_tabs', browser_read: 'read_page', browser_eval: 'eval',
   browser_click: 'click', browser_type: 'type', browser_key: 'key',
@@ -336,6 +419,43 @@ function buildMcpServer(sessionId) {
   srv.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: MCP_TOOLS }));
   srv.setRequestHandler(CallToolRequestSchema, async (req) => {
     const name = req.params.name;
+
+    if (name === 'browser_batch') {
+      const args = req.params.arguments || {};
+      const batchTab = args.tabId;
+      const steps = Array.isArray(args.steps) ? args.steps : [];
+      if (!steps.length) return { isError: true, content: [{ type: 'text', text: 'browser_batch: "steps" must be a non-empty array' }] };
+      const content = [];
+      const summary = [];
+      let failed = false;
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i] || {};
+        const rawAction = BATCH_ACTIONS[step.action];
+        if (!rawAction) {
+          summary.push(`#${i} ${step.action}: ERROR unknown action`);
+          failed = true; break;
+        }
+        const { action: _drop, tabId: stepTab, ...stepParams } = step;
+        const useTab = stepTab != null ? stepTab : batchTab;
+        const stepTimeout = rawAction === 'wait_for' ? Number(stepParams.timeoutMs || 10000) + 5000 : undefined;
+        try {
+          const r = await sendBrowserCommand({ action: rawAction, params: stepParams, tabId: useTab, sessionId, timeoutMs: stepTimeout });
+          if (rawAction === 'screenshot') {
+            const raw = typeof r === 'string' ? r : (r && r.data) || '';
+            content.push({ type: 'image', data: String(raw).replace(/^data:image\/png;base64,/, ''), mimeType: 'image/png' });
+            summary.push(`#${i} screenshot: ok`);
+          } else {
+            summary.push(`#${i} ${step.action}: ${typeof r === 'string' ? r : JSON.stringify(r)}`);
+          }
+        } catch (e) {
+          summary.push(`#${i} ${step.action}: ERROR ${e.message}`);
+          failed = true; break;
+        }
+      }
+      content.unshift({ type: 'text', text: (failed ? 'batch stopped on error\n' : 'batch ok\n') + summary.join('\n') });
+      return failed ? { isError: true, content } : { content };
+    }
+
     const action = TOOL_ACTION[name];
     if (!action) return { isError: true, content: [{ type: 'text', text: 'unknown tool ' + name }] };
     const { tabId, ...params } = (req.params.arguments || {});
@@ -507,6 +627,21 @@ app.post('/sessions/:id/rename', (req, res) => {
   if (ic) s.icon = ic.slice(0, 4);
   persistSessions();
   res.json(s.meta());
+});
+
+// A session's Claude Code hook (claude-hook.js) reports its state/mode here.
+// Broadcast it to the session's attached panes (in-panel chip) and to the
+// background SW over the control channel (native tab-group color + mode icon).
+app.post('/sessions/:id/state', (req, res) => {
+  const s = sessions.get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'no session' });
+  const b = req.body || {};
+  const STATES = new Set(['busy', 'idle', 'waiting']);
+  if (typeof b.state === 'string' && STATES.has(b.state)) s.state = b.state;
+  if (typeof b.mode === 'string' && b.mode) s.mode = b.mode;
+  s.broadcast({ t: 'state', state: s.state, mode: s.mode });
+  broadcastControl({ t: 'sstate', id: s.id, state: s.state, mode: s.mode });
+  res.json({ ok: true });
 });
 
 app.post('/sessions/:id/kill', (req, res) => {

@@ -4,6 +4,7 @@ node_modules/
 # secrets / local runtime
 .token
 .sessions.json
+.claude-hooks.json
 *.env
 .env
 !.env.example

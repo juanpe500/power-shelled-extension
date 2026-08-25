@@ -48,7 +48,7 @@ Alt‑tabbing between the browser and a terminal breaks flow — especially when
   `claude --model claude-opus-4-8 --remote-control <folder>-<random>`, with a collision‑free Remote Control name.
 - ⟳ **Resume past conversations** — the **Resume** button lists the previous Claude Code sessions for the chosen folder (last prompt + last reply preview) and relaunches the exact one you pick via `--resume <uuid>`; live sessions are locked out so you can't double‑resume.
 - 💾 **Persistent shells** — backed by a local `node-pty` server; reattach replays scrollback. **Survives both browser _and_ server restarts** — on reboot the server recreates every session and resumes its Claude conversation by UUID; panes auto‑reconnect.
-- 🌐 **Browser automation for Claude Code** — a Claude agent in a pane can read/click/type/screenshot/navigate the page docked beside it (9 MCP tools) — no official "Claude in Chrome" extension needed. Every terminal is **locked to its own tab(s)**, so agents can't touch each other's pages.
+- 🌐 **Browser automation for Claude Code** — a Claude agent in a pane can read/click/type/screenshot/navigate the page docked beside it (10 MCP tools, including a `browser_batch` that runs a whole fill‑and‑validate flow in one call) — no official "Claude in Chrome" extension needed. Every terminal is **locked to its own tab(s)**, so agents can't touch each other's pages.
 - 👁️ **Visual action HUD** — those browser actions draw an animated fake cursor, highlights, ripples and toasts on the page so you can **watch** what the agent does. Toggle off in settings.
 - 📊 **Live cost dashboard** — the server console runs an amber‑on‑black TUI tracking every `claude` session's live token spend and $ cost, plus a 30‑day history (line chart, heatmap, budget bars) swept from your transcripts.
 - 🎨 **Fully themeable** — one `:root` palette in CSS drives the whole UI *and* the terminal colors.
@@ -142,7 +142,9 @@ Click **＋**, pick a shell, choose a **Workspace** and drill to the folder you 
 
 ### Browser automation
 
-Claude Code in a pane can drive the page next to it. An in‑process **MCP server** (`/mcp`, streamable‑HTTP) exposes 9 tools — `browser_list_tabs · read · eval · click · type · key · screenshot · navigate · wait_for` — wired up by the `.mcp.json` in the repo root. Each call travels `MCP → server → control WebSocket → background service worker → the tab`, executed with `chrome.scripting` for DOM work and the Chrome DevTools Protocol (`chrome.debugger`) for trusted clicks/keys and full‑page screenshots.
+Claude Code in a pane can drive the page next to it. An in‑process **MCP server** (`/mcp`, streamable‑HTTP) exposes 10 tools — `browser_list_tabs · read · eval · click · type · key · screenshot · navigate · wait_for · batch` — wired up by the `.mcp.json` in the repo root. Each call travels `MCP → server → control WebSocket → background service worker → the tab`, executed with `chrome.scripting` for DOM work and the Chrome DevTools Protocol (`chrome.debugger`) for trusted clicks/keys and full‑page screenshots.
+
+`browser_batch` runs several of those actions in order in a **single call** — e.g. type into three fields, click submit, then screenshot to confirm — so a form fill doesn't cost one round‑trip per field. Steps run sequentially and **stop on the first failure** (a field that doesn't match never reaches the submit click); any `screenshot`/`read` step returns its output inline for validation.
 
 The terminal session's id is threaded end‑to‑end (`CT_SESSION_ID` env → `x-ct-session` header → command payload), so a session is **strictly isolated to the tab(s) its panes are open on** — it can only see and act on those, never another window's page.
 
